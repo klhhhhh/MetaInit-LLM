@@ -62,7 +62,7 @@ def merge_3d_parallel_checkpoints(ckpt_paths, output_path):
     print(f"Merged checkpoint saved to {output_path}")
 
 
-def extract_weights(model, save_path="models/gpt2_checkpoint/gpt2_weights.pth"):
+def extract_weights(model, save_path):
     """
     提取 GPT2 关键权重，并存储为 PyTorch 格式
     :param model: NeMo 训练好的 GPT2 模型

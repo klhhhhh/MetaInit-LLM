@@ -5,9 +5,9 @@ defaults:
 name: megatron_gpt
 
 trainer:
-  devices: 1
+  devices: 8
   num_nodes: 1
-  accelerator: gpu
+  accelerator: cpu
   precision: bf16
   logger: False # logger provided by exp_manager
   enable_checkpointing: False

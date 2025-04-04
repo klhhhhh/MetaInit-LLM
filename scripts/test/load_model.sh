@@ -1,3 +1,4 @@
-python /global/homes/k/klhhhhh/MetaInit-LLM/nemo_utils/model_loader.py
-    --config-path=/global/homes/k/klhhhhh/MetaInit-LLM/configs \
-    --config-name=megatron_gpt_124m_config \
+torchrun \
+    --nnodes=1 \
+    --nproc_per_node=8 \
+    /global/homes/k/klhhhhh/MetaInit-LLM/nemo_utils/model_loader.py

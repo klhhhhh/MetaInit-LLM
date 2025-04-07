@@ -77,19 +77,19 @@ model:
   micro_batch_size: 4 # limited by GPU memory
   global_batch_size: 8 # will use more micro batches to reach global batch size
   rampup_batch_size: null # Should be a list of 3 values: [<start_batch_size>, <batch_size_increment>, <rampup_samples>]
-  tensor_model_parallel_size: 1 # intra-layer model parallelism
-  pipeline_model_parallel_size: 1 # inter-layer model parallelism
+  tensor_model_parallel_size: 4 # intra-layer model parallelism
+  pipeline_model_parallel_size: 2 # inter-layer model parallelism
   virtual_pipeline_model_parallel_size: null # interleaved pipeline
   expert_model_parallel_size: 1 # expert model parallelism
 
   # model architecture
-  encoder_seq_length: 512
+  encoder_seq_length: 1024
   max_position_embeddings: ${.encoder_seq_length}
   num_layers: 12
   hidden_size: 768
   ffn_hidden_size: 3072 # Transformer FFN hidden size. Usually 4 * hidden_size.
   num_attention_heads: 12
-  init_method_std: 0.02 # Standard deviation of the zero mean normal distribution used for weight initialization.')
+  init_method_std: 0.021 # Standard deviation of the zero mean normal distribution used for weight initialization.')
   use_scaled_init_method: True # use scaled residuals initialization
   hidden_dropout: 0.1 # Dropout probability for hidden state transformer.
   attention_dropout: 0.1 # Dropout probability for attention

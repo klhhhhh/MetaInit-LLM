@@ -1,7 +1,7 @@
 import logging
+import argparse
+
 from pathlib import Path
-import torch
-import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from hydra import initialize_config_dir, compose
 from hydra.utils import to_absolute_path
@@ -40,4 +40,13 @@ def load_model_to_cpu(nemo_path: str):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    model = load_model_to_cpu(nemo_path="/pscratch/sd/k/klhhhhh/checkpoints/nemo/gpt/megatron_gpt.nemo")
+    parser = argparse.ArgumentParser(description="A simple checkpoint loading processing script.")
+    parser.add_argument("--nemo_path", type=str, help="The path to .nemo file for loading.")
+    args = parser.parse_args()
+
+    nemo_path = args.nemo_path
+    logging.info(f"Loading model from {nemo_path} onto CPU.")
+    # Load the model
+
+    model = load_model_to_cpu(nemo_path=nemo_path)
+    

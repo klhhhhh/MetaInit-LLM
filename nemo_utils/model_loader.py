@@ -37,6 +37,20 @@ def load_model_to_cpu(nemo_path: str):
     logging.info("Model successfully loaded onto CPU.")
     return model
 
+def print_state_dict(model):
+    # Extract the state_dict
+    state_dict = model.state_dict()
+
+    # Print all parameter names
+    print("\n=== Model state_dict keys ===")
+    for name in state_dict:
+        print(name)
+
+    # Optionally, print the shape of a specific weight
+    print("\nExample weight:")
+    example_key = next(iter(state_dict))
+    print(f"{example_key}: shape = {state_dict[example_key].shape}")
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
@@ -49,4 +63,6 @@ if __name__ == "__main__":
     # Load the model
 
     model = load_model_to_cpu(nemo_path=nemo_path)
+
+    print_state_dict(model=model)
     

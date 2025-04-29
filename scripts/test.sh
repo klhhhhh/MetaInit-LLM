@@ -7,8 +7,8 @@ source /u/klin4/envs/build_nemo.sh
 export PATH="/u/klin4/.conda/envs/nemo/bin:$PATH"
 
 torchrun \
-    --nnodes=8 \
-    --nproc_per_node=4 \
+    --nnodes=1 \
+    --nproc_per_node=1 \
     --master_addr $MASTER_ADDR \
     --master_port $MASTER_PORT \
     --rdzv_id=gpt_124m \
@@ -17,8 +17,8 @@ torchrun \
     /u/klin4/MetaInit-LLM/training/megatron_gpt_pretraining.py  \
     --config-path=/u/klin4/MetaInit-LLM/conf \
     --config-name=megatron_gpt_config \
-    trainer.devices=4 \
-    trainer.num_nodes=8 \
+    trainer.devices=1 \
+    trainer.num_nodes=1 \
     trainer.max_epochs=null \
     trainer.max_steps=1000 \
     trainer.val_check_interval=300 \
@@ -60,7 +60,7 @@ torchrun \
     exp_manager.resume_if_exists=True \
     exp_manager.resume_ignore_no_checkpoint=True \
     exp_manager.create_checkpoint_callback=True \
-    exp_manager.checkpoint_callback_params.dirpath=/work/hdd/bdrw/klin4/checkpoints/nemo/gpt \
+    exp_manager.checkpoint_callback_params.dirpath=/work/hdd/bdrw/klin4/checkpoints/nemo/test \
     exp_manager.checkpoint_callback_params.monitor=val_loss \
     exp_manager.checkpoint_callback_params.save_top_k=3 \
     exp_manager.checkpoint_callback_params.mode=min \

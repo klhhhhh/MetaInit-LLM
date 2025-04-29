@@ -20,7 +20,7 @@ ROOT="/work/hdd/bdrw/klin4/openwebtext"
 
 cd /u/klin4/NeMo-modular-training
 python ./scripts/nlp_language_modeling/preprocess_data_for_megatron.py \
---input="$ROOT/openwebtext.jsonl" \
+--input="$ROOT/openwebtext_cleaned.jsonl" \
 --json-keys=text \
 --tokenizer-library=megatron \
 --vocab /work/hdd/bdrw/klin4/wiki/gpt2-vocab.json \

@@ -6,6 +6,8 @@ source /u/klin4/envs/build_nemo.sh
 
 export PATH="/u/klin4/.conda/envs/nemo/bin:$PATH"
 
+export WANDB_API_KEY=54c49dff7abb6ed19894a8aaec8b305d316f0072
+
 torchrun \
     --nnodes=8 \
     --nproc_per_node=4 \
@@ -20,8 +22,8 @@ torchrun \
     trainer.devices=4 \
     trainer.num_nodes=8 \
     trainer.max_epochs=null \
-    trainer.max_steps=1000 \
-    trainer.val_check_interval=300 \
+    trainer.max_steps=10000 \
+    trainer.val_check_interval=500 \
     trainer.log_every_n_steps=25 \
     trainer.limit_val_batches=50 \
     trainer.limit_test_batches=50 \
@@ -30,7 +32,7 @@ torchrun \
     model.transformer_engine=True \
     model.megatron_amp_O2=False \
     model.micro_batch_size=96 \
-    model.global_batch_size=96 \
+    model.global_batch_size=3072 \
     model.tensor_model_parallel_size=1 \
     model.pipeline_model_parallel_size=1 \
     model.max_position_embeddings=1024 \
@@ -44,7 +46,7 @@ torchrun \
     model.layernorm_epsilon=1e-5 \
     model.tokenizer.vocab_file=/work/hdd/bdrw/klin4/wiki/gpt2-merges.json \
     model.tokenizer.merge_file=/work/hdd/bdrw/klin4/wiki/gpt2-merges.txt \
-    model.data.data_prefix=[1,/work/hdd/bdrw/klin4/wiki/hfbpe_gpt_training_data_text_document] \
+    model.data.data_prefix=[1,/work/hdd/bdrw/klin4/openwebtext/gpt2_openwebtext_text_document] \
     model.data.num_workers=2 \
     model.data.seq_length=1024 \
     model.data.splits_string=\'980,10,10\' \
@@ -57,6 +59,8 @@ torchrun \
     model.optim.sched.constant_steps=80000 \
     model.optim.sched.min_lr=6e-5 \
     exp_manager.create_wandb_logger=True \
+    exp_manager.wandb_logger_kwargs.projects="gpt124m" \
+    exp_manager.wandb_logger_kwargs.name="run_$SLURM_JOB_ID" \
     exp_manager.resume_if_exists=True \
     exp_manager.resume_ignore_no_checkpoint=True \
     exp_manager.create_checkpoint_callback=True \

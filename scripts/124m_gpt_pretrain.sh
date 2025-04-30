@@ -5,15 +5,38 @@ conda activate nemo
 source /u/klin4/envs/build_nemo.sh
 
 export PATH="/u/klin4/.conda/envs/nemo/bin:$PATH"
-
 export WANDB_API_KEY=54c49dff7abb6ed19894a8aaec8b305d316f0072
+
+RDZV_FILE="$HOME/.rdzv/rdzv_${SLURM_JOB_ID}.txt"
+mkdir -p "$(dirname $RDZV_FILE)"
+
+# rank 0
+if [ "$SLURM_PROCID" -eq 0 ]; then
+  MASTER_ADDR=$(scontrol show hostnames $SLURM_NODELIST | head -n 1 )
+  MASTER_PORT=$(shuf -i 49152-65535 -n 1)
+  echo "$MASTER_ADDR $MASTER_PORT" > "$RDZV_FILE"
+fi
+
+# all nodes wait
+while [ ! -f "$RDZV_FILE" ]; do sleep 1; done
+
+# all nodes read
+read MASTER_ADDR MASTER_PORT < "$RDZV_FILE"
+export MASTER_ADDR
+export MASTER_PORT
+
+echo "$MASTER_ADDR"
+echo "$MASTER_PORT"
+
+export NVIDIA_PYTORCH_VERSION=24.12
+
 
 torchrun \
     --nnodes=8 \
     --nproc_per_node=4 \
     --master_addr $MASTER_ADDR \
     --master_port $MASTER_PORT \
-    --rdzv_id=gpt_124m \
+    --rdzv_id=gpt_124m_$SLURM_JOB_ID\
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     /u/klin4/MetaInit-LLM/training/megatron_gpt_pretraining.py  \
@@ -59,7 +82,7 @@ torchrun \
     model.optim.sched.constant_steps=80000 \
     model.optim.sched.min_lr=6e-5 \
     exp_manager.create_wandb_logger=True \
-    exp_manager.wandb_logger_kwargs.projects="gpt124m" \
+    exp_manager.wandb_logger_kwargs.project="gpt124m" \
     exp_manager.wandb_logger_kwargs.name="run_$SLURM_JOB_ID" \
     exp_manager.resume_if_exists=True \
     exp_manager.resume_ignore_no_checkpoint=True \

@@ -20,8 +20,8 @@ torchrun \
     trainer.devices=1 \
     trainer.num_nodes=1 \
     trainer.max_epochs=null \
-    trainer.max_steps=1000 \
-    trainer.val_check_interval=300 \
+    trainer.max_steps=500 \
+    trainer.val_check_interval=50 \
     trainer.log_every_n_steps=25 \
     trainer.limit_val_batches=50 \
     trainer.limit_test_batches=50 \

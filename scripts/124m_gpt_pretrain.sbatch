@@ -3,7 +3,7 @@
 #SBATCH --partition=ghx4
 #SBATCH --time=24:00:00
 #SBATCH --nodes=8
-#SBATCH --tasks-per-node=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --gpus-per-task=4
 #SBATCH --gpu-bind=none
@@ -12,5 +12,5 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=nankaicslk@gmail.com
 
-srun --export=ALL \
+srun --export=ALL --cpu-bind=none \
      bash /u/klin4/MetaInit-LLM/scripts/124m_gpt_pretrain.sh

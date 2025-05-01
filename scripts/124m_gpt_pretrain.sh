@@ -45,7 +45,7 @@ torchrun \
     trainer.devices=4 \
     trainer.num_nodes=8 \
     trainer.max_epochs=null \
-    trainer.max_steps=10000 \
+    trainer.max_steps=50000 \
     trainer.val_check_interval=500 \
     trainer.log_every_n_steps=25 \
     trainer.limit_val_batches=50 \
@@ -83,7 +83,9 @@ torchrun \
     model.optim.sched.min_lr=6e-5 \
     exp_manager.create_wandb_logger=True \
     exp_manager.wandb_logger_kwargs.project="gpt124m" \
-    exp_manager.wandb_logger_kwargs.name="run_$SLURM_JOB_ID" \
+    exp_manager.wandb_logger_kwargs.name="run_668135" \
+    exp_manager.wandb_logger_kwargs.id="gf65h7lx" \
+    exp_manager.wandb_logger_kwargs.resume="must" \
     exp_manager.resume_if_exists=True \
     exp_manager.resume_ignore_no_checkpoint=True \
     exp_manager.create_checkpoint_callback=True \

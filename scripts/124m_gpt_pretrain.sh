@@ -1,8 +1,8 @@
 #!/bin/bash
 
 eval "$(conda shell.bash hook)"
-conda activate nemo
 source /u/klin4/envs/build_nemo.sh
+conda activate nemo
 
 export PATH="/u/klin4/.conda/envs/nemo/bin:$PATH"
 export WANDB_API_KEY=54c49dff7abb6ed19894a8aaec8b305d316f0072
@@ -67,7 +67,7 @@ torchrun \
     model.init_method_std=0.021 \
     model.hidden_dropout=0.1 \
     model.layernorm_epsilon=1e-5 \
-    model.tokenizer.vocab_file=/work/hdd/bdrw/klin4/wiki/gpt2-merges.json \
+    model.tokenizer.vocab_file=/work/hdd/bdrw/klin4/wiki/gpt2-vocab.json \
     model.tokenizer.merge_file=/work/hdd/bdrw/klin4/wiki/gpt2-merges.txt \
     model.data.data_prefix=[1,/work/hdd/bdrw/klin4/openwebtext/gpt2_openwebtext_text_document] \
     model.data.num_workers=2 \
@@ -81,16 +81,17 @@ torchrun \
     model.optim.sched.warmup_steps=750 \
     model.optim.sched.constant_steps=80000 \
     model.optim.sched.min_lr=6e-5 \
+    exp_manager.exp_dir=/work/hdd/bdrw/klin4 \
     exp_manager.create_wandb_logger=True \
     exp_manager.wandb_logger_kwargs.project="gpt124m" \
-    exp_manager.wandb_logger_kwargs.name="run_668135" \
-    exp_manager.wandb_logger_kwargs.id="gf65h7lx" \
-    exp_manager.wandb_logger_kwargs.resume="must" \
+    exp_manager.wandb_logger_kwargs.name="run_$SLURM_JOB_ID" \
+    # exp_manager.wandb_logger_kwargs.id="gf65h7lx" \
+    # exp_manager.wandb_logger_kwargs.resume="allow" \
     exp_manager.resume_if_exists=True \
     exp_manager.resume_ignore_no_checkpoint=True \
     exp_manager.create_checkpoint_callback=True \
-    exp_manager.checkpoint_callback_params.dirpath=/work/hdd/bdrw/klin4/checkpoints/nemo/gpt \
+    exp_manager.checkpoint_callback_params.dirpath=/work/hdd/bdrw/klin4/checkpoints/nemo/gpt124m \
     exp_manager.checkpoint_callback_params.monitor=val_loss \
-    exp_manager.checkpoint_callback_params.save_top_k=3 \
+    exp_manager.checkpoint_callback_params.save_top_k=-1 \
     exp_manager.checkpoint_callback_params.mode=min \
     exp_manager.checkpoint_callback_params.always_save_nemo=True

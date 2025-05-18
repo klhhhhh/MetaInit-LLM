@@ -1,8 +1,8 @@
 #!/bin/bash
 
 eval "$(conda shell.bash hook)"
-conda activate nemo
 source /u/klin4/envs/build_nemo.sh
+conda activate nemo
 
 export PATH="/u/klin4/.conda/envs/nemo/bin:$PATH"
 export WANDB_API_KEY=54c49dff7abb6ed19894a8aaec8b305d316f0072
@@ -38,14 +38,14 @@ torchrun \
     --rdzv_id=gpt_350m \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    /global/homes/k/klhhhhh/NeMo-modular-training/examples/nlp/language_modeling/megatron_gpt_pretraining.py \
-    --config-path=/global/homes/k/klhhhhh/NeMo-modular-training/examples/nlp/language_modeling/conf \
+    /u/klin4/MetaInit-LLM/training/megatron_gpt_pretraining.py \
+    --config-path=/u/klin4/MetaInit-LLM/conf \
     --config-name=megatron_gpt_config \
     trainer.devices=4 \
     trainer.num_nodes=8 \
     trainer.max_epochs=null \
     trainer.max_steps=200000 \
-    trainer.val_check_interval=3000 \
+    trainer.val_check_interval=1000 \
     trainer.log_every_n_steps=25 \
     trainer.limit_val_batches=50 \
     trainer.limit_test_batches=50 \
@@ -66,8 +66,8 @@ torchrun \
     model.init_method_std=0.021 \
     model.hidden_dropout=0.1 \
     model.layernorm_epsilon=1e-5 \
-    model.tokenizer.vocab_file=gpt2-vocab.json \
-    model.tokenizer.merge_file=gpt2-merges.txt \
+    model.tokenizer.vocab_file=/work/hdd/bdrw/klin4/wiki/gpt2-vocab.json \
+    model.tokenizer.merge_file=/work/hdd/bdrw/klin4/wiki/gpt2-merges.txt \
     model.data.data_prefix=[1,/work/hdd/bdrw/klin4/openwebtext/gpt2_openwebtext_text_document] \
     model.data.num_workers=2 \
     model.data.seq_length=1024 \
@@ -80,14 +80,17 @@ torchrun \
     model.optim.sched.warmup_steps=2000 \
     model.optim.sched.constant_steps=80000 \
     model.optim.sched.min_lr=6e-5 \
+    exp_manager.exp_dir=/work/hdd/bdrw/klin4 \
     exp_manager.create_wandb_logger=True \
     exp_manager.wandb_logger_kwargs.project="gpt350m" \
-    exp_manager.wandb_logger_kwargs.name="run_$SLURM_JOB_ID" \
+    exp_manager.wandb_logger_kwargs.name="run_696883" \
+    exp_manager.wandb_logger_kwargs.id="sk4htb6d" \
+    exp_manager.wandb_logger_kwargs.resume="allow" \
     exp_manager.resume_if_exists=True \
     exp_manager.resume_ignore_no_checkpoint=True \
     exp_manager.create_checkpoint_callback=True \
     exp_manager.checkpoint_callback_params.dirpath=/work/hdd/bdrw/klin4/checkpoints/nemo/gpt_350m \
     exp_manager.checkpoint_callback_params.monitor=val_loss \
-    exp_manager.checkpoint_callback_params.save_top_k=5 \
+    exp_manager.checkpoint_callback_params.save_top_k=200 \
     exp_manager.checkpoint_callback_params.mode=min \
     exp_manager.checkpoint_callback_params.always_save_nemo=True

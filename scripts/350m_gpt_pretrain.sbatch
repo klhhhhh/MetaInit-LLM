@@ -8,7 +8,7 @@
 #SBATCH --gpus-per-task=4
 #SBATCH --gpu-bind=none
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64g
+#SBATCH --mem=128g
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=nankaicslk@gmail.com
 

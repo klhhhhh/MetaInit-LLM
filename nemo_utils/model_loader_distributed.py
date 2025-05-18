@@ -51,11 +51,6 @@ def print_state_dict(model):
     example_key = next(iter(state_dict))
     print(f"{example_key}: shape = {state_dict[example_key].shape}")
 
-def print_shape(model):
-    print("\n=== Model shape ===")
-    for name, param in model.named_parameters():
-        print(f"{name}: {param.shape}")
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
@@ -70,5 +65,4 @@ if __name__ == "__main__":
     model = load_model_to_cpu(nemo_path=nemo_path)
 
     print_state_dict(model=model)
-    print_shape(model=model)
     

@@ -19,8 +19,6 @@ class ModelProjectionUtils:
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
         self.large_model, self.large_state_dict = self._load_large_model(large_model_cfg_path)
-        print(type(self.small_model.model))
-        print(type(self.large_model.model))
 
     def _load_small_model(self, path):
         if self.device == "cpu":
@@ -89,7 +87,7 @@ class ModelProjectionUtils:
         return W_large
 
     def project_parameters(self, rank=64):
-        small_state_dict = self.small_model.state_dict()
+        small_state_dict = self.small_model.model.state_dict()
         large_num_layers = self.large_model.cfg.num_layers  # Assumes large_model has a cfg attribute
 
         # Step 1: Interpolate parameters between layers

@@ -1,16 +1,26 @@
+import os
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import torch
 import torch.nn.functional as F
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from omegaconf import OmegaConf
-from .model_loader import load_model_to_cpu
-from .model_builder import build_model
+from model_loader import load_model_to_cpu
+from model_builder import build_model
 
 class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
         self.large_model, self.large_state_dict = self._load_large_model(large_model_cfg_path)
+        print(type(self.small_model.model))
+        print(type(self.large_model.model))
 
     def _load_small_model(self, path):
         if self.device == "cpu":
@@ -83,12 +93,12 @@ class ModelProjectionUtils:
         large_num_layers = self.large_model.cfg.num_layers  # Assumes large_model has a cfg attribute
 
         # Step 1: Interpolate parameters between layers
-        if hasattr(self.small_model.decoder, "layers") and hasattr(self.large_model.decoder, "layers"):
-            small_layers = self.small_model.decoder.layers
+        if hasattr(self.small_model.model.decoder, "layers") and hasattr(self.large_model.model.decoder, "layers"):
+            small_layers = self.small_model.model.decoder.layers
             interpolated_params_list = self.expand_layers(small_layers, large_num_layers)
 
             # Step 2: Map interpolated parameters to large model layers and perform hidden_size projection
-            for layer_idx, large_layer in enumerate(self.large_model.decoder.layers):
+            for layer_idx, large_layer in enumerate(self.large_model.model.decoder.layers):
                 interpolated_params = interpolated_params_list[layer_idx]
                 
                 for name, param_large in large_layer.named_parameters():
@@ -151,3 +161,23 @@ class ModelProjectionUtils:
         os.makedirs(Path(save_path).parent, exist_ok=True)
         torch.save(self.large_state_dict, save_path)
         print(f"✅ Projected model weights saved to: {save_path}")
+
+
+if __name__ == "__main__":
+    # import os
+    # import argparse
+
+    # parser = argparse.ArgumentParser(description="Project small model weights to large model.")
+    # parser.add_argument("--small_model_path", type=str, required=True, help="Path to the small model checkpoint.")
+    # parser.add_argument("--large_model_cfg_path", type=str, required=True, help="Path to the large model config.")
+    # parser.add_argument("--save_path", type=str, required=True, help="Path to save the projected model weights.")
+    # parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device to load the model.")
+
+    # args = parser.parse_args()
+
+    small_model_path = "/work/hdd/bdrw/klin4/checkpoints/nemo/gpt/megatron_gpt.nemo"
+    large_model_cfg_name = "megatron_gpt_350m_config"
+    device = "cpu"
+    utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
+    utils.project_parameters()
+    # utils.save_projected_model(args.save_path)

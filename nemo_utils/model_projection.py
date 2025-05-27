@@ -70,6 +70,23 @@ class ModelProjectionUtils:
             getattr(new_layer, name).data.copy_(interpolated_param)
         return new_layer
 
+    def lora_style_projection(self, W_small, target_shape, rank=64):
+        """
+        Perform LoRA-style low-rank projection for initializing larger model weights.
+        W_large = (A @ B) @ W_small @ (A @ B).T
+        A: [d_large, r], B: [r, d_small]
+        """
+        d_large, d_small = target_shape
+
+        # Initialize A and B
+        A = torch.randn(d_large, rank, device=W_small.device) * 0.01
+        B = torch.randn(rank, d_small, device=W_small.device) * 0.01
+
+        P = A @ B  # [d_large, d_small]
+        W_large = P @ W_small @ P.T  # final shape: [d_large, d_large]
+
+        return W_large
+    
     def low_rank_projection(self, W_small, target_shape, rank=64):
         """
         Perform low-rank projection on the hidden_size dimension.
@@ -108,7 +125,7 @@ class ModelProjectionUtils:
                         param_large.data.copy_(param_small)
                     elif len(param_small.shape) == 2:
                         # Linear weights: hidden_size mismatch
-                        projected_param = self.low_rank_projection(
+                        projected_param = self.lora_style_projection(
                             param_small, param_large.shape, rank=rank
                         )
                         param_large.data.copy_(projected_param)
@@ -137,7 +154,7 @@ class ModelProjectionUtils:
             if param_small.shape == param_large.shape:
                 self.large_state_dict[name] = param_small
             elif len(param_small.shape) == 2:
-                self.large_state_dict[name] = self.low_rank_projection(
+                self.large_state_dict[name] = self.lora_style_projection(
                     param_small, param_large.shape, rank=rank
                 )
             elif len(param_small.shape) == 1:

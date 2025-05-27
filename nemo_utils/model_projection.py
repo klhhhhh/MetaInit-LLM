@@ -14,11 +14,22 @@ from omegaconf import OmegaConf
 from model_loader import load_model_to_cpu
 from model_builder import build_model
 
+class LoRAProjector(nn.Module):
+    def __init__(self, d_small, d_large, rank=64):
+        super().__init__()
+        self.A = nn.Parameter(torch.randn(d_large, rank) * 0.01)
+        self.B = nn.Parameter(torch.randn(rank, d_small) * 0.01)
+
+    def forward(self, W_small):
+        P = self.A @ self.B  # [d_large, d_small]
+        return P @ W_small @ P.T  # [d_large, d_large]
+
 class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
         self.large_model, self.large_state_dict = self._load_large_model(large_model_cfg_path)
+        self.lora_modules = {}  # name → LoRA projector
 
     def _load_small_model(self, path):
         if self.device == "cpu":
@@ -102,6 +113,79 @@ class ModelProjectionUtils:
 
         W_large = P_out @ W_small @ P_in  # Shape: (out_large, in_large)
         return W_large
+
+    def project_parameters_learnable(self, rank=64):
+        small_state_dict = self.small_model.model.state_dict()
+        large_num_layers = self.large_model.cfg.num_layers  # Assumes large_model has a cfg attribute
+
+        # Step 1: Interpolate parameters between layers
+        if hasattr(self.small_model.model.decoder, "layers") and hasattr(self.large_model.model.decoder, "layers"):
+            small_layers = self.small_model.model.decoder.layers
+            interpolated_params_list = self.expand_layers(small_layers, large_num_layers)
+
+            # Step 2: Map interpolated parameters to large model layers and perform hidden_size projection
+            for layer_idx, large_layer in enumerate(self.large_model.model.decoder.layers):
+                interpolated_params = interpolated_params_list[layer_idx]
+
+                for name, param_large in large_layer.named_parameters():
+                    if name not in interpolated_params:
+                        continue
+                    param_small = interpolated_params[name]
+
+                    if param_small.shape == param_large.shape:
+                        param_large.data.copy_(param_small)
+                    elif len(param_small.shape) == 2:
+                        projector = LoRAProjector(param_small.shape[1], param_large.shape[0], rank)
+                        projected_param = projector(param_small)
+                        param_large.data.copy_(projected_param)
+
+                        full_name = f"decoder.layers.{layer_idx}.{name}"
+                        self.lora_modules[full_name] = projector
+                        self.large_model.add_module(f"lora_proj_{full_name.replace('.', '_')}", projector)
+                    elif len(param_small.shape) == 1:
+                        # Bias / LayerNorm weights interpolation
+                        new_size = param_large.shape[0]
+                        old_size = param_small.shape[0]
+
+                        if new_size == old_size:
+                            param_large.data.copy_(param_small)
+                        else:
+                            interpolated = F.interpolate(
+                                param_small.unsqueeze(0).unsqueeze(0),
+                                size=new_size,
+                                mode="linear",
+                                align_corners=True
+                            ).squeeze()
+                            param_large.data.copy_(interpolated)
+
+        # Step 3: Handle direct mapping of non-layer parameters (e.g., embedding and final layer norm)
+        for name, param_small in small_state_dict.items():
+            if 'layers' in name or name not in self.large_state_dict:
+                continue
+
+            param_large = self.large_state_dict[name]
+            if param_small.shape == param_large.shape:
+                self.large_state_dict[name] = param_small
+            elif len(param_small.shape) == 2:
+                projector = LoRAProjector(param_small.shape[1], param_large.shape[0], rank)
+                projected_param = projector(param_small)
+                self.large_state_dict[name] = projected_param
+
+                self.lora_modules[name] = projector
+                self.large_model.add_module(f"lora_proj_{name.replace('.', '_')}", projector)
+            elif len(param_small.shape) == 1:
+                new_size = param_large.shape[0]
+                old_size = param_small.shape[0]
+                if new_size == old_size:
+                    self.large_state_dict[name] = param_small
+                else:
+                    interpolated = F.interpolate(
+                        param_small.unsqueeze(0).unsqueeze(0),
+                        size=new_size,
+                        mode="linear",
+                        align_corners=True
+                    ).squeeze()
+                    self.large_state_dict[name] = interpolated
 
     def project_parameters(self, rank=64):
         small_state_dict = self.small_model.model.state_dict()

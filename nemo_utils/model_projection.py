@@ -213,4 +213,3 @@ if __name__ == "__main__":
     device = "cpu"
     utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
     utils.project_parameters()
-    # utils.save_projected_model(args.save_path)

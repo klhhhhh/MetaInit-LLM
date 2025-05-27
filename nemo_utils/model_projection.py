@@ -14,15 +14,21 @@ from omegaconf import OmegaConf
 from model_loader import load_model_to_cpu
 from model_builder import build_model
 
-class LoRAProjector(nn.Module):
-    def __init__(self, d_small, d_large, rank=64):
+class ProjectedLinear(nn.Module):
+    def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
         super().__init__()
-        self.A = nn.Parameter(torch.randn(d_large, rank) * 0.01)
-        self.B = nn.Parameter(torch.randn(rank, d_small) * 0.01)
+        d_small_out, d_small_in = W_small.shape
 
-    def forward(self, W_small):
-        P = self.A @ self.B  # [d_large, d_small]
-        return P @ W_small @ P.T  # [d_large, d_large]
+        # register buffer not parameter, save memory
+        self.register_buffer('W_small', W_small.clone().detach())  # not a Parameter
+
+        self.A = nn.Parameter(torch.randn(d_large, rank) * 0.01)
+        self.B = nn.Parameter(torch.randn(rank, d_small_out) * 0.01)
+
+    def forward(self, x):
+        P = self.A @ self.B
+        W_large = P @ self.W_small @ P.T
+        return F.linear(x, W_large)
 
 class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
@@ -101,6 +107,11 @@ class ModelProjectionUtils:
         W_large = P_out @ W_small @ P_in  # Shape: (out_large, in_large)
         return W_large
 
+    def replace_with_projected_linear(self, parent_module, attr_name, W_small, out_dim, rank):
+        projected = ProjectedLinear(W_small, out_dim, rank)
+        setattr(parent_module, attr_name, projected)
+        print(f"[Learnable] Replaced {attr_name} with ProjectedLinear")
+
     def project_parameters(self, rank=64, learnable=False):
         small_state_dict = self.small_model.model.state_dict()
         large_num_layers = self.large_model.cfg.num_layers  # Assumes large_model has a cfg attribute
@@ -123,14 +134,17 @@ class ModelProjectionUtils:
                         param_large.data.copy_(param_small)
                     elif len(param_small.shape) == 2:
                         if learnable:
-                            projector = LoRAProjector(param_small.shape[1], param_large.shape[0], rank)
-                            projected_param = projector(param_small)
-                            full_name = f"decoder.layers.{layer_idx}.{name}"
-                            self.lora_modules[full_name] = projector
-                            self.large_model.add_module(f"lora_proj_{full_name.replace('.', '_')}", projector)
+                            module_path = name.split(".")[0]
+                            self.replace_with_projected_linear(
+                                getattr(large_layer, module_path),
+                                name.split(".")[1],
+                                param_small,
+                                param_large.shape[0],
+                                rank
+                            )
                         else:
                             projected_param = self.lora_style_projection(param_small, param_large.shape, rank)
-                        param_large.data.copy_(projected_param)
+                            param_large.data.copy_(projected_param)
                     elif len(param_small.shape) == 1:
                         # Bias / LayerNorm weights interpolation
                         new_size = param_large.shape[0]
@@ -157,13 +171,10 @@ class ModelProjectionUtils:
                 self.large_state_dict[name] = param_small
             elif len(param_small.shape) == 2:
                 if learnable:
-                    projector = LoRAProjector(param_small.shape[1], param_large.shape[0], rank)
-                    projected_param = projector(param_small)
-                    self.lora_modules[name] = projector
-                    self.large_model.add_module(f"lora_proj_{name.replace('.', '_')}", projector)
+                    print(f"[Learnable] Non-layer {name} projection skipped (requires custom module override)")
                 else:
                     projected_param = self.lora_style_projection(param_small, param_large.shape, rank)
-                self.large_state_dict[name] = projected_param
+                    self.large_state_dict[name] = projected_param
             elif len(param_small.shape) == 1:
                 new_size = param_large.shape[0]
                 old_size = param_small.shape[0]

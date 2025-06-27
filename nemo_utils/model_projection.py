@@ -15,21 +15,57 @@ from omegaconf import OmegaConf
 from model_loader import load_model_to_cpu
 from model_builder import build_model
 
-class ProjectedLinear(nn.Module):
+class SymmetricProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
         super().__init__()
         d_small_out, d_small_in = W_small.shape
-
-        # register buffer not parameter, save memory
-        self.register_buffer('W_small', W_small.clone().detach())  # not a Parameter
-
+        self.register_buffer('W_small', W_small.clone().detach())
         self.A = nn.Parameter(torch.randn(d_large, rank) * 0.01)
         self.B = nn.Parameter(torch.randn(rank, d_small_out) * 0.01)
 
     def forward(self, x):
-        P = self.A @ self.B
-        W_large = P @ self.W_small @ P.T
+        P = self.A @ self.B                      # [d_large, d_small_out]
+        W_large = P @ self.W_small @ P.T         # [d_large, d_large]
         return F.linear(x, W_large)
+
+class AsymmetricProjectedLinear(nn.Module):
+    def __init__(self, W_small: torch.Tensor, d_out_large: int, d_in_large: int, rank: int = 64):
+        super().__init__()
+        d_out_small, d_in_small = W_small.shape
+        self.register_buffer('W_small', W_small.clone().detach())
+
+        self.A1 = nn.Parameter(torch.randn(d_out_large, rank) * 0.01)
+        self.A2 = nn.Parameter(torch.randn(rank, d_out_small) * 0.01)
+        self.B1 = nn.Parameter(torch.randn(d_in_small, rank) * 0.01)
+        self.B2 = nn.Parameter(torch.randn(rank, d_in_large) * 0.01)
+
+    def forward(self, x):
+        W_large = (self.A1 @ (self.A2 @ self.W_small @ self.B1)) @ self.B2
+        return F.linear(x, W_large)
+
+class QKVProjectedLinear(nn.Module):
+    def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
+        super().__init__()
+        self.qkv_small = torch.chunk(W_small.clone().detach(), 3, dim=0)  # [Q,K,V] small
+        self.projectors = nn.ModuleList([
+            SymmetricProjectedLinear(qkv, d_large, rank) for qkv in self.qkv_small
+        ])
+
+    def forward(self, x):
+        outs = [proj(x) for proj in self.projectors]
+        return torch.cat(outs, dim=-1)  # [B, T, 3 * d_large]
+
+def get_projector_module(W_small, target_shape, rank, name):
+    if "self_attention.linear_qkv" in name:
+        return QKVProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
+    elif "self_attention.linear_proj" in name:
+        return SymmetricProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
+    elif "mlp.linear_fc" in name:
+        return AsymmetricProjectedLinear(
+            W_small, d_out_large=target_shape[0], d_in_large=target_shape[1], rank=rank
+        )
+    else:
+        raise ValueError(f"Unsupported projection layer for name: {name}")
 
 class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
@@ -148,10 +184,18 @@ class ModelProjectionUtils:
 
         return W_large
 
-    def replace_with_projected_linear(self, parent_module, attr_name, W_small, out_dim, rank):
-        projected = ProjectedLinear(W_small, out_dim, rank)
-        setattr(parent_module, attr_name, projected)
-        print(f"[Learnable] Replaced {attr_name} with ProjectedLinear")
+    def replace_with_projected_linear(self, parent_module, attr_name, W_small, target_shape, rank, name):
+        if "linear_qkv" in name:
+            projector = QKVProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
+        elif "linear_proj" in name:
+            projector = SymmetricProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
+        elif "mlp" in name:
+            projector = AsymmetricProjectedLinear(W_small, d_out_large=target_shape[0], d_in_large=target_shape[1], rank=rank)
+        else:
+            raise ValueError(f"Unknown layer for projector replacement: {name}")
+        setattr(parent_module, attr_name, projector)
+        print(f"[Learnable] Replaced {attr_name} in {name} with {projector.__class__.__name__}")
+
 
     def project_parameters(self, rank=64, learnable=False):
         small_state_dict = self.small_model.model.state_dict()
@@ -164,6 +208,7 @@ class ModelProjectionUtils:
 
             # Step 2: Map interpolated parameters to large model layers and perform hidden_size projection
             for layer_idx, large_layer in enumerate(self.large_model.model.decoder.layers):
+                print(layer_idx)
                 interpolated_params = interpolated_params_list[layer_idx]
 
                 for name, param_large in large_layer.named_parameters():
@@ -178,11 +223,12 @@ class ModelProjectionUtils:
                         if learnable:
                             module_path = name.split(".")[0]
                             self.replace_with_projected_linear(
-                                getattr(large_layer, module_path),
-                                name.split(".")[1],
-                                param_small,
-                                param_large.shape[0],
-                                rank
+                                parent_module=getattr(large_layer, module_path),
+                                attr_name=name.split(".")[1],
+                                W_small=param_small,
+                                target_shape=param_large.shape,
+                                rank=rank,
+                                name=name
                             )
                         else:
                             projected_param = self.dispatch_projection(
@@ -265,3 +311,4 @@ if __name__ == "__main__":
     device = "cpu"
     utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
     utils.project_parameters()
+    utils.project_parameters(learnable=True)

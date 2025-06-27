@@ -71,7 +71,7 @@ class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
-        self.large_model, self.large_state_dict = self._load_large_model(large_model_cfg_path)
+        self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager = self._load_large_model(large_model_cfg_path)
         self.lora_modules = {}  # name → LoRA projector
 
     def _load_small_model(self, path):
@@ -82,8 +82,22 @@ class ModelProjectionUtils:
         return model
 
     def _load_large_model(self, cfg_name):
-        large_model = build_model(cfg_name)
-        return large_model, large_model.state_dict()
+        large_model, trainer, exp_manager = build_model(cfg_name)
+        return large_model, large_model.state_dict(), trainer, exp_manager
+    
+    def get_large_model_trainer(self):
+        """
+        Returns the trainer associated with the large model.
+        This is useful for training or evaluation after projection.
+        """
+        return self.large_trainer
+
+    def get_large_model_exp_manager(self):
+        """
+        Returns the experiment manager associated with the large model.
+        This is useful for managing checkpoints, logs, etc.
+        """
+        return self.large_exp_manager
 
     def expand_layers(self, small_layers, target_num_layers):
         """

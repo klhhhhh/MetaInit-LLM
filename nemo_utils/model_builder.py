@@ -34,7 +34,7 @@ def build_model(cfg_name, map_location="cpu"):
     # Instantiate the model
     model = MegatronGPTModel(cfg.model, trainer)
 
-    return model
+    return model, trainer, cfg.exp_manager
 
 if __name__ == "__main__":
 

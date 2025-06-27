@@ -24,17 +24,16 @@ def main(cfg) -> None:
     small_model_path = "/work/hdd/bdrw/klin4/checkpoints/nemo/gpt/megatron_gpt.nemo"
     large_model_cfg_name = "megatron_gpt_350m_config"
     device = "cpu"
-    utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
-    model_utils.project_parameters(rank=cfg.model.get("projection_rank", 64), learnable=True)
-    model = model_utils.large_model
+    projection_utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
+    projection_utils.project_parameters(rank=64, learnable=True)
+    model = projection_utils.large_model
+    trainer = projection_utils.get_large_model_trainer()
+    large_model_exp_manager = projection_utils.get_large_model_exp_manager()
 
     # Step 3: Move model to appropriate device (GPU)
     model = model.to(torch.cuda.current_device())
 
-    trainer = MegatronTrainerBuilder(cfg).create_trainer()
-    exp_manager(trainer, cfg.exp_manager)
-    
-    model.trainer = trainer  # Ensure Lightning hooks work
+    exp_manager(trainer, large_model_exp_manager)
 
     # Step 4: Begin training
     logging.info("Starting training with projected model...")

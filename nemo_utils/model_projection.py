@@ -7,6 +7,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
@@ -74,37 +75,77 @@ class ModelProjectionUtils:
 
         return expanded_params
 
-    def lora_style_projection(self, W_small, target_shape, rank=64):
+    def dispatch_projection(self, name, W_small, target_shape, projection_rank=32):
         """
-        Perform LoRA-style low-rank projection for initializing larger model weights.
-        W_large = (A @ B) @ W_small @ (A @ B).T
-        A: [d_large, r], B: [r, d_small]
+        Determine the projection method based on the parameter name:
+        - qkv: Split into Q, K, V and use symmetric projection
+        - linear_proj: Use symmetric projection
+        - mlp (fc1, fc2): Use asymmetric projection
         """
-        d_large, d_small = target_shape
+        if "linear_qkv.weight" in name and W_small.shape[0] % 3 == 0:
+            # Split into Q, K, V
+            qkv_chunks = torch.chunk(W_small, 3, dim=0)
+            out_chunks = target_shape[0] // 3
+            W_large_chunks = []
 
-        # Initialize A and B
-        A = torch.randn(d_large, rank, device=W_small.device) * 0.01
-        B = torch.randn(rank, d_small, device=W_small.device) * 0.01
+            for i, qkv in enumerate(qkv_chunks):
+                projected = self.lora_style_projection_symmetric(
+                    qkv, (out_chunks, target_shape[1]), projection_rank
+                )
+                W_large_chunks.append(projected)
 
-        P = A @ B  # [d_large, d_small]
-        W_large = P @ W_small @ P.T  # final shape: [d_large, d_large]
+            return torch.cat(W_large_chunks, dim=0)
 
-        return W_large
+        elif "linear_proj.weight" in name:
+            return self.lora_style_projection_symmetric(W_small, target_shape, projection_rank)
+
+        elif "mlp" in name or "fc1" in name or "fc2" in name:
+            return self.lora_style_projection_asymmetric(W_small, target_shape, projection_rank)
+
+        else:
+            # Default to symmetric projection (you can also raise a warning)
+            return self.lora_style_projection_symmetric(W_small, target_shape, projection_rank)
+
     
-    def low_rank_projection(self, W_small, target_shape, rank=64):
+    def lora_style_projection_symmetric(self, W_small, target_shape, rank=32):
         """
-        Perform low-rank projection on the hidden_size dimension.
+        Symmetric LoRA projection: W_large = P @ W_small @ P^T
+        Suitable for matrices like self_attention.linear_proj.weight with shape [h, h].
+        """
+        d_out, d_in = target_shape
+        d_s_out, d_s_in = W_small.shape
+
+        A = torch.randn(d_out, rank, device=W_small.device) * 0.01
+        B = torch.randn(rank, d_s_out, device=W_small.device) * 0.01
+        P = A @ B  # [d_out, d_s_out]
+
+        W_large = P @ W_small @ P.T  # [d_out, d_out]
+        return W_large
+
+    def lora_style_projection_asymmetric(self, W_small, target_shape, projection_rank=32):
+        """
+        Perform LoRA-style low-rank projection with additional factorization (projection_rank) to reduce computation.
+        
+        W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
+        A1: [out_large, projection_rank]
+        A2: [projection_rank, out_small]
+        B1: [in_small, projection_rank]
+        B2: [projection_rank, in_large]
+        
+        Final shape: [out_large, in_large]
         """
         out_large, in_large = target_shape
         out_small, in_small = W_small.shape
 
-        if (out_large, in_large) == (out_small, in_small):
-            return W_small
+        # Low-rank factors for A and B
+        A1 = torch.randn(out_large, projection_rank, device=W_small.device) * 0.01
+        A2 = torch.randn(projection_rank, out_small, device=W_small.device) * 0.01
+        B1 = torch.randn(in_small, projection_rank, device=W_small.device) * 0.01
+        B2 = torch.randn(projection_rank, in_large, device=W_small.device) * 0.01
 
-        P_in = torch.randn(in_small, in_large, device=W_small.device) / (in_small ** 0.5)
-        P_out = torch.randn(out_large, out_small, device=W_small.device) / (out_small ** 0.5)
+        # Final projection: W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
+        W_large = (A1 @ (A2 @ W_small @ B1)) @ B2  # shape: [out_large, in_large]
 
-        W_large = P_out @ W_small @ P_in  # Shape: (out_large, in_large)
         return W_large
 
     def replace_with_projected_linear(self, parent_module, attr_name, W_small, out_dim, rank):
@@ -128,6 +169,7 @@ class ModelProjectionUtils:
                 for name, param_large in large_layer.named_parameters():
                     if name not in interpolated_params:
                         continue
+                    print(name)
                     param_small = interpolated_params[name]
 
                     if param_small.shape == param_large.shape:
@@ -143,7 +185,12 @@ class ModelProjectionUtils:
                                 rank
                             )
                         else:
-                            projected_param = self.lora_style_projection(param_small, param_large.shape, rank)
+                            projected_param = self.dispatch_projection(
+                                name=name,
+                                W_small=param_small,
+                                target_shape=param_large.shape,
+                                projection_rank=rank
+                            )
                             param_large.data.copy_(projected_param)
                     elif len(param_small.shape) == 1:
                         # Bias / LayerNorm weights interpolation
@@ -173,7 +220,12 @@ class ModelProjectionUtils:
                 if learnable:
                     print(f"[Learnable] Non-layer {name} projection skipped (requires custom module override)")
                 else:
-                    projected_param = self.lora_style_projection(param_small, param_large.shape, rank)
+                    projected_param = self.dispatch_projection(
+                        name=name,
+                        W_small=param_small,
+                        target_shape=param_large.shape,
+                        projection_rank=rank
+                    )
                     self.large_state_dict[name] = projected_param
             elif len(param_small.shape) == 1:
                 new_size = param_large.shape[0]

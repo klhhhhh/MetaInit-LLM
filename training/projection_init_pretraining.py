@@ -18,7 +18,7 @@ from nemo_utils.model_projection import ModelProjectionUtils
 torch._dynamo.config.suppress_errors = True
 mp.set_start_method("spawn", force=True)
 
-def main(cfg) -> None:
+def main() -> None:
     logging.info("Loading and projecting small model to large model (CPU stage)...")
     
     small_model_path = "/work/hdd/bdrw/klin4/checkpoints/nemo/gpt/megatron_gpt.nemo"

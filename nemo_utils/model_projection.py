@@ -222,7 +222,7 @@ class ModelProjectionUtils:
 
             # Step 2: Map interpolated parameters to large model layers and perform hidden_size projection
             for layer_idx, large_layer in enumerate(self.large_model.model.decoder.layers):
-                print(layer_idx)
+                print("Layer: "layer_idx)
                 interpolated_params = interpolated_params_list[layer_idx]
 
                 for name, param_large in large_layer.named_parameters():

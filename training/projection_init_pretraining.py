@@ -10,7 +10,10 @@ from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 
-from model_projection_utils import ModelProjectionUtils
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from nemo_utils.model_projection import ModelProjectionUtils
 
 torch._dynamo.config.suppress_errors = True
 mp.set_start_method("spawn", force=True)
@@ -27,6 +30,10 @@ def main(cfg) -> None:
 
     # Step 3: Move model to appropriate device (GPU)
     model = model.to(torch.cuda.current_device())
+
+    trainer = MegatronTrainerBuilder(cfg).create_trainer()
+    exp_manager(trainer, cfg.exp_manager)
+    
     model.trainer = trainer  # Ensure Lightning hooks work
 
     # Step 4: Begin training

@@ -12,8 +12,8 @@ import torch.nn.functional as F
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from omegaconf import OmegaConf
-from model_loader import load_model_to_cpu
-from model_builder import build_model
+from nemo_utils.model_loader import load_model_to_cpu
+from nemo_utils.model_builder import build_model
 
 class SymmetricProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):

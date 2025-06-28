@@ -7,9 +7,9 @@ export HF_DATASETS_CACHE=$HF_HOME/datasets
 export TRANSFORMERS_CACHE=$HF_HOME/models
 
 torchrun --nproc-per-node=1 --no-python lm_eval --model nemo_lm \
-  --model_args path='/pscratch/sd/k/klhhhhh/checkpoints/nemo/exp/unzip',data_parallel_size=1  \
+  --model_args path='/pscratch/sd/k/klhhhhh/checkpoints/nemo/exp/unzip_350m',data_parallel_size=1  \
   --wandb_args project=lm-eval-harness-gpt-winogrande \
   --tasks lambada_openai \
   --batch_size 32 \
-  --output_path /pscratch/sd/k/klhhhhh/checkpoints/nemo/exp/winogrande \
+  --output_path /pscratch/sd/k/klhhhhh/checkpoints/nemo/exp/winogrande_350m \
   --log_samples

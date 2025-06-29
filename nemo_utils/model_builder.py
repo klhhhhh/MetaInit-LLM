@@ -39,5 +39,5 @@ def build_model(cfg_name, map_location="cpu"):
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
-    model = build_model("megatron_gpt_350m_config")
+    model, trainer, exp_manager = build_model("megatron_gpt_350m_config")
 

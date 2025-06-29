@@ -74,7 +74,7 @@ model:
 
   # specify micro_batch_size, global_batch_size, and model parallelism
   # gradient accumulation will be done automatically based on data_parallel_size
-  micro_batch_size: 4 # limited by GPU memory
+  micro_batch_size: 8 # limited by GPU memory
   global_batch_size: 8 # will use more micro batches to reach global batch size
   rampup_batch_size: null # Should be a list of 3 values: [<start_batch_size>, <batch_size_increment>, <rampup_samples>]
   tensor_model_parallel_size: 1 # intra-layer model parallelism
@@ -83,12 +83,12 @@ model:
   expert_model_parallel_size: 1 # expert model parallelism
 
   # model architecture
-  encoder_seq_length: 512
+  encoder_seq_length: 1024
   max_position_embeddings: ${.encoder_seq_length}
-  num_layers: 12
-  hidden_size: 768
-  ffn_hidden_size: 3072 # Transformer FFN hidden size. Usually 4 * hidden_size.
-  num_attention_heads: 12
+  num_layers: 24
+  hidden_size: 1024
+  ffn_hidden_size: 4096 # Transformer FFN hidden size. Usually 4 * hidden_size.
+  num_attention_heads: 16
   init_method_std: 0.02 # Standard deviation of the zero mean normal distribution used for weight initialization.')
   use_scaled_init_method: True # use scaled residuals initialization
   hidden_dropout: 0.1 # Dropout probability for hidden state transformer.
@@ -144,7 +144,7 @@ model:
   fp16_lm_cross_entropy: False # Move the cross entropy unreduced loss calculation for lm head to fp16
 
   # Megatron O2-style half-precision
-  megatron_amp_O2: True # Enable O2-level automatic mixed precision using main parameters
+  megatron_amp_O2: False # Enable O2-level automatic mixed precision using main parameters
   grad_allreduce_chunk_size_mb: 125
 
   # Fusion

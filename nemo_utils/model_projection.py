@@ -71,7 +71,10 @@ class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
+        self.small_model = self._load_small_model(small_model_path)
+        self.small_model = self._load_small_model(small_model_path)
         self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager = self._load_large_model(large_model_cfg_path)
+        self.small_model = self._load_small_model(small_model_path)
         self.lora_modules = {}  # name → LoRA projector
 
     def _load_small_model(self, path):
@@ -222,7 +225,7 @@ class ModelProjectionUtils:
 
             # Step 2: Map interpolated parameters to large model layers and perform hidden_size projection
             for layer_idx, large_layer in enumerate(self.large_model.model.decoder.layers):
-                print("Layer: " + layer_idx)
+                print("Layer: " + str(layer_idx))
                 interpolated_params = interpolated_params_list[layer_idx]
 
                 for name, param_large in large_layer.named_parameters():

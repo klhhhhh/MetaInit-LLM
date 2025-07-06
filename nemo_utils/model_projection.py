@@ -71,10 +71,7 @@ class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
-        self.small_model = self._load_small_model(small_model_path)
-        self.small_model = self._load_small_model(small_model_path)
         self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager = self._load_large_model(large_model_cfg_path)
-        self.small_model = self._load_small_model(small_model_path)
         self.lora_modules = {}  # name → LoRA projector
 
     def _load_small_model(self, path):
@@ -324,7 +321,7 @@ if __name__ == "__main__":
     # args = parser.parse_args()
 
     small_model_path = "/work/hdd/bdrw/klin4/checkpoints/nemo/gpt/megatron_gpt.nemo"
-    large_model_cfg_name = "megatron_gpt_350m_config"
+    large_model_cfg_name = "megatron_gpt_350m_config_projection"
     device = "cpu"
     utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
     utils.project_parameters()

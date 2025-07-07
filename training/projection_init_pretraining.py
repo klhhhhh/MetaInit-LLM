@@ -24,20 +24,21 @@ mp.set_start_method("spawn", force=True)
 def main(
     small_model_path: str,
     large_model_cfg_name: str,
-    device: str,
+    project_device: str,
+    train_device: str,
     rank: int,
     learnable: bool,
 ) -> None:
     logging.info("Loading and projecting small model to large model (CPU stage)...")
 
-    projection_utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
+    projection_utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, project_device)
     projection_utils.project_parameters(rank=rank, learnable=learnable)
     model = projection_utils.large_model
     trainer = projection_utils.get_large_model_trainer()
     large_model_exp_manager = projection_utils.get_large_model_exp_manager()
 
     # Step 3: Move model to appropriate device (GPU if requested)
-    if device == "cuda":
+    if train_device == "cuda":
         model = model.to(torch.cuda.current_device())
 
     exp_manager(trainer, large_model_exp_manager)
@@ -61,7 +62,14 @@ if __name__ == '__main__':
         help="Configuration name for the large model.",
     )
     parser.add_argument(
-        "--device",
+        "--project_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Device to load the model onto (default: cpu).",
+    )
+    parser.add_argument(
+        "--train_device",
         type=str,
         default="cpu",
         choices=["cpu", "cuda"],
@@ -83,7 +91,8 @@ if __name__ == '__main__':
     main(
         small_model_path=args.small_model_path,
         large_model_cfg_name=args.large_model_cfg_name,
-        device=args.device,
+        project_device=args.project_device,
+        train_device=args.train_device,
         rank=args.rank,
         learnable=args.learnable,
     )

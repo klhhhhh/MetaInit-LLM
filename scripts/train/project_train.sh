@@ -22,7 +22,8 @@ SCRIPT_PATH="$PROJECT_DIR/training/projection_init_pretraining.py"
 # Parameters passed to Python
 SMALL_MODEL_PATH="/work/hdd/bdrw/klin4/checkpoints/nemo/gpt/megatron_gpt.nemo"
 LARGE_MODEL_CFG_NAME="megatron_gpt_350m_config"
-DEVICE="cuda"
+PROJECT_DEVICE="cpu"
+TRAIN_DEVICE="cuda"
 RANK=64
 LEARNABLE=""
 
@@ -36,6 +37,7 @@ torchrun \
   "$SCRIPT_PATH" \
   --small_model_path "$SMALL_MODEL_PATH" \
   --large_model_cfg_name "$LARGE_MODEL_CFG_NAME" \
-  --device "$DEVICE" \
+  --project_device "$PROJECT_DEVICE" \
+  --train_device "$TRAIN_DEVICE" \
   --rank "$RANK" \
   $LEARNABLE

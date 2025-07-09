@@ -20,12 +20,12 @@ NPROC_PER_NODE=1
 SCRIPT_PATH="$PROJECT_DIR/training/projection_init_pretraining.py"
 
 # Parameters passed to Python
-SMALL_MODEL_PATH="/work/hdd/bdrw/klin4/run_gpt_124m/megatron_gpt/checkpoints/gpt-124-last"
+SMALL_MODEL_PATH="/work/hdd/bdrw/klin4/checkpoints/nemo/gpt/megatron_gpt.nemo"
 LARGE_MODEL_CFG_NAME="megatron_gpt_350m_config"
 PROJECT_DEVICE="cpu"
 TRAIN_DEVICE="cuda"
 RANK=64
-LEARNABLE=""
+LEARNABLE="--learnable"
 
 # Enable learnable if needed
 # LEARNABLE="--learnable"

@@ -33,17 +33,17 @@ def main(
 
     projection_utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, project_device)
     projection_utils.project_parameters(rank=rank, learnable=learnable)
+
+    projection_utils.free_small_model()
+    torch.cuda.empty_cache()
+
     model = projection_utils.large_model
     trainer = projection_utils.get_large_model_trainer()
     large_model_exp_manager = projection_utils.get_large_model_exp_manager()
 
-    # Step 3: Move model to appropriate device (GPU if requested)
-    if train_device == "cuda":
-        model = model.to(torch.cuda.current_device())
-
     exp_manager(trainer, large_model_exp_manager)
 
-    # Step 4: Begin training
+    # Begin training
     logging.info("Starting training with projected model...")
     trainer.fit(model)
 

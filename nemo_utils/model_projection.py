@@ -220,8 +220,6 @@ class ModelProjectionUtils:
             del self.small_model
             torch.cuda.empty_cache()
 
-
-
     def project_parameters(self, rank=64, learnable=False):
         small_state_dict = self.small_model.model.state_dict()
         large_num_layers = self.large_model.cfg.num_layers  # Assumes large_model has a cfg attribute
@@ -311,9 +309,7 @@ class ModelProjectionUtils:
                         align_corners=True
                     ).squeeze()
                     self.large_state_dict[name] = interpolated
-            
-        # Step 4: Delete memory of small model
-        torch.cuda.empty_cache()
+
 
     def save_projected_model(self, save_path):
         os.makedirs(Path(save_path).parent, exist_ok=True)

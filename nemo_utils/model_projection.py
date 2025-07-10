@@ -210,6 +210,17 @@ class ModelProjectionUtils:
         setattr(parent_module, attr_name, projector)
         print(f"[Learnable] Replaced {attr_name} in {name} with {projector.__class__.__name__}")
 
+    def free_small_model(self):
+        """
+        Free the small model from memory and clear GPU cache if necessary.
+        """
+        if hasattr(self, "small_model"):
+            print("Freeing small model and clearing GPU cache.")
+            self.small_model = self.small_model.cpu()
+            del self.small_model
+            torch.cuda.empty_cache()
+
+
 
     def project_parameters(self, rank=64, learnable=False):
         small_state_dict = self.small_model.model.state_dict()
@@ -300,7 +311,9 @@ class ModelProjectionUtils:
                         align_corners=True
                     ).squeeze()
                     self.large_state_dict[name] = interpolated
-
+            
+        # Step 4: Delete memory of small model
+        torch.cuda.empty_cache()
 
     def save_projected_model(self, save_path):
         os.makedirs(Path(save_path).parent, exist_ok=True)
@@ -321,7 +334,7 @@ if __name__ == "__main__":
     # args = parser.parse_args()
 
     small_model_path = "/work/hdd/bdrw/klin4/checkpoints/nemo/gpt/megatron_gpt.nemo"
-    large_model_cfg_name = "megatron_gpt_350m_config_projection"
+    large_model_cfg_name = "megatron_gpt_350m_config"
     device = "cpu"
     utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, device)
     utils.project_parameters()

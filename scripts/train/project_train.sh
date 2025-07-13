@@ -48,7 +48,7 @@ NPROC_PER_NODE=4
 SCRIPT_PATH="$PROJECT_DIR/training/projection_init_pretraining.py"
 
 # Parameters passed to Python
-SMALL_MODEL_PATH="/work/hdd/bdrw/klin4/run_gpt_124m/megatron_gpt/checkpoints/gpt-124-last"
+SMALL_MODEL_PATH="/work/hdd/bdrw/klin4/run_gpt_124m/megatron_gpt/checkpoints_124m/gpt-124-last"
 LARGE_MODEL_CFG_NAME="megatron_gpt_350m_config"
 PROJECT_DEVICE="cpu"
 TRAIN_DEVICE="cuda"
@@ -62,6 +62,11 @@ LEARNABLE=""
 torchrun \
   --nnodes=$NNODES \
   --nproc_per_node=$NPROC_PER_NODE \
+  --master_addr $MASTER_ADDR \
+  --master_port $MASTER_PORT \
+  --rdzv_id=gpt_350m_project \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
   "$SCRIPT_PATH" \
   --small_model_path "$SMALL_MODEL_PATH" \
   --large_model_cfg_name "$LARGE_MODEL_CFG_NAME" \

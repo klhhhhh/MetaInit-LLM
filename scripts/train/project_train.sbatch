@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=bdrw-dtai-gh
 #SBATCH --partition=ghx4
-#SBATCH --time=48:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4

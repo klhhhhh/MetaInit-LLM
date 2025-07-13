@@ -5,8 +5,8 @@ defaults:
 name: megatron_gpt
 
 trainer:
-  devices: 1
-  num_nodes: 1
+  devices: 4
+  num_nodes: 8
   accelerator: gpu
   precision: bf16
   logger: False # logger provided by exp_manager
@@ -14,8 +14,8 @@ trainer:
   use_distributed_sampler: False
   max_epochs: -1 # PTL default. In practice, max_steps will be reached first.
   max_steps: 100000 # consumed_samples = global_step * micro_batch_size * data_parallel_size * accumulate_grad_batches
-  log_every_n_steps: 10
-  val_check_interval: 100
+  log_every_n_steps: 25
+  val_check_interval: 1000
   limit_val_batches: 50
   limit_test_batches: 50
   accumulate_grad_batches: 1 # do not modify, grad acc is automatic for training megatron models
@@ -35,12 +35,12 @@ s3_checkpointing:
 
 exp_manager:
   explicit_log_dir: null
-  exp_dir: null
+  exp_dir: /work/hdd/bdrw/klin4/run_gpt_350m_project_train
   name: megatron_gpt
-  create_wandb_logger: False
+  create_wandb_logger: True
   wandb_logger_kwargs:
-    project: null
-    name: null
+    project: project_train_350m
+    name: run_2
   create_neptune_logger: false
   neptune_logger_kwargs:
     project: null
@@ -54,11 +54,11 @@ exp_manager:
   resume_from_checkpoint: ${model.resume_from_checkpoint}
   create_checkpoint_callback: True
   checkpoint_callback_params:
-    dirpath: null # to use S3 checkpointing, set the dirpath in format s3://bucket/key
+    dirpath: /work/hdd/bdrw/klin4/run_gpt_350m_project_train/megatron_gpt/checkpoints # to use S3 checkpointing, set the dirpath in format s3://bucket/key
     monitor: val_loss
-    save_top_k: 10
+    save_top_k: 100
     mode: min
-    always_save_nemo: False # saves nemo file during validation, not implemented for model parallel
+    always_save_nemo: True # saves nemo file during validation, not implemented for model parallel
     save_nemo_on_train_end: False # not recommended when training large models on clusters with short time limits
     filename: 'megatron_gpt--{val_loss:.2f}-{step}-{consumed_samples}'
     model_parallel_size: ${multiply:${model.tensor_model_parallel_size}, ${model.pipeline_model_parallel_size}}
@@ -74,8 +74,8 @@ model:
 
   # specify micro_batch_size, global_batch_size, and model parallelism
   # gradient accumulation will be done automatically based on data_parallel_size
-  micro_batch_size: 8 # limited by GPU memory
-  global_batch_size: 8 # will use more micro batches to reach global batch size
+  micro_batch_size: 16 # limited by GPU memory
+  global_batch_size: 512 # will use more micro batches to reach global batch size
   rampup_batch_size: null # Should be a list of 3 values: [<start_batch_size>, <batch_size_increment>, <rampup_samples>]
   tensor_model_parallel_size: 1 # intra-layer model parallelism
   pipeline_model_parallel_size: 1 # inter-layer model parallelism
@@ -131,8 +131,8 @@ model:
     library: 'megatron'
     type: 'GPT2BPETokenizer'
     model: null
-    vocab_file: null
-    merge_file: null
+    vocab_file: /work/hdd/bdrw/klin4/wiki/gpt2-vocab.json
+    merge_file: /work/hdd/bdrw/klin4/wiki/gpt2-merges.txt
     delimiter: null # only used for tabular tokenizer
     sentencepiece_legacy: False # Legacy=True allows you to add special tokens to sentencepiece tokenizers.
 
@@ -269,7 +269,7 @@ model:
     # Dictionary: can override from CLI "model.data.data_prefix"={"train":[1.0, /path/to/data], "validation":/path/to/data, "test":/path/to/test}
     # Or see example below:
     # "model.data.data_prefix: {train:[1.0,/path/to/data], validation:[/path/to/data], test:[/path/to/test]}"
-    data_prefix: ???
+    data_prefix: [1,/work/hdd/bdrw/klin4/openwebtext/gpt2_openwebtext_text_document]
     index_mapping_dir: null # path to save index mapping .npy files, by default will save in the same location as data_prefix
     data_impl: mmap
     mmap_bin_files: True

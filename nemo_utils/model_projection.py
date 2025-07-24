@@ -124,6 +124,17 @@ class ModelProjectionUtils:
             expanded_params.append(interpolated_layer_params)
 
         return expanded_params
+        
+    def normalize_projection(self, W_projected, W_target):
+        """
+        Normalize the projected weight matrix to match the Frobenius norm of the target matrix.
+        """
+        projected_norm = torch.norm(W_projected, p='fro')
+        target_norm = torch.norm(W_target, p='fro')
+        if projected_norm > 0:
+            print(f"Normalizing projection from {projected_norm:.4f} to {target_norm:.4f}")
+            W_projected = W_projected * (target_norm / projected_norm)
+        return W_projected
 
     def dispatch_projection(self, name, W_small, target_shape, projection_rank=32):
         """
@@ -132,6 +143,8 @@ class ModelProjectionUtils:
         - linear_proj: Use symmetric projection
         - mlp (fc1, fc2): Use asymmetric projection
         """
+        self.current_param_name = name
+
         if "linear_qkv.weight" in name and W_small.shape[0] % 3 == 0:
             # Split into Q, K, V
             qkv_chunks = torch.chunk(W_small, 3, dim=0)
@@ -170,6 +183,7 @@ class ModelProjectionUtils:
         P = A @ B  # [d_out, d_s_out]
 
         W_large = P @ W_small @ P.T  # [d_out, d_out]
+        W_large = self.normalize_projection(W_large, self.large_state_dict.get(self.current_param_name, W_large))
         return W_large
 
     def lora_style_projection_asymmetric(self, W_small, target_shape, projection_rank=32):
@@ -195,7 +209,7 @@ class ModelProjectionUtils:
 
         # Final projection: W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
         W_large = (A1 @ (A2 @ W_small @ B1)) @ B2  # shape: [out_large, in_large]
-
+        W_large = self.normalize_projection(W_large, self.large_state_dict.get(self.current_param_name, W_large))
         return W_large
 
     def replace_with_projected_linear(self, parent_module, attr_name, W_small, target_shape, rank, name):

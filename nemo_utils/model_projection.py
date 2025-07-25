@@ -72,6 +72,8 @@ class ModelProjectionUtils:
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
         self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager = self._load_large_model(large_model_cfg_path)
+        print("=== Large Model State Dict Keys ===")
+        print(self.large_state_dict.keys())
         self.lora_modules = {}  # name → LoRA projector
 
     def _load_small_model(self, path):
@@ -136,7 +138,7 @@ class ModelProjectionUtils:
             W_projected = W_projected * (target_norm / projected_norm)
         return W_projected
 
-    def dispatch_projection(self, name, W_small, target_shape, projection_rank=32):
+    def dispatch_projection(self, name, W_small, target_shape, target_param, projection_rank=32):
         """
         Determine the projection method based on the parameter name:
         - qkv: Split into Q, K, V and use symmetric projection
@@ -153,24 +155,24 @@ class ModelProjectionUtils:
 
             for i, qkv in enumerate(qkv_chunks):
                 projected = self.lora_style_projection_symmetric(
-                    qkv, (out_chunks, target_shape[1]), projection_rank
+                    qkv, (out_chunks, target_shape[1]), target_param, projection_rank
                 )
                 W_large_chunks.append(projected)
 
             return torch.cat(W_large_chunks, dim=0)
 
         elif "linear_proj.weight" in name:
-            return self.lora_style_projection_symmetric(W_small, target_shape, projection_rank)
+            return self.lora_style_projection_symmetric(W_small, target_shape, target_param, projection_rank)
 
         elif "mlp" in name or "fc1" in name or "fc2" in name:
-            return self.lora_style_projection_asymmetric(W_small, target_shape, projection_rank)
+            return self.lora_style_projection_asymmetric(W_small, target_shape, target_param, projection_rank)
 
         else:
             # Default to symmetric projection (you can also raise a warning)
-            return self.lora_style_projection_symmetric(W_small, target_shape, projection_rank)
+            return self.lora_style_projection_symmetric(W_small, target_shape, target_param, projection_rank)
 
     
-    def lora_style_projection_symmetric(self, W_small, target_shape, rank=32):
+    def lora_style_projection_symmetric(self, W_small, target_shape, target_param, rank=32):
         """
         Symmetric LoRA projection: W_large = P @ W_small @ P^T
         Suitable for matrices like self_attention.linear_proj.weight with shape [h, h].
@@ -183,10 +185,10 @@ class ModelProjectionUtils:
         P = A @ B  # [d_out, d_s_out]
 
         W_large = P @ W_small @ P.T  # [d_out, d_out]
-        W_large = self.normalize_projection(W_large, self.large_state_dict.get(self.current_param_name, W_large))
+        W_large = self.normalize_projection(W_large, target_param)
         return W_large
 
-    def lora_style_projection_asymmetric(self, W_small, target_shape, projection_rank=32):
+    def lora_style_projection_asymmetric(self, W_small, target_shape, target_param, projection_rank=32):
         """
         Perform LoRA-style low-rank projection with additional factorization (projection_rank) to reduce computation.
         
@@ -209,7 +211,7 @@ class ModelProjectionUtils:
 
         # Final projection: W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
         W_large = (A1 @ (A2 @ W_small @ B1)) @ B2  # shape: [out_large, in_large]
-        W_large = self.normalize_projection(W_large, self.large_state_dict.get(self.current_param_name, W_large))
+        W_large = self.normalize_projection(W_large, target_param)
         return W_large
 
     def replace_with_projected_linear(self, parent_module, attr_name, W_small, target_shape, rank, name):
@@ -245,6 +247,7 @@ class ModelProjectionUtils:
 
             # Step 2: Map interpolated parameters to large model layers and perform hidden_size projection
             for layer_idx, large_layer in enumerate(self.large_model.model.decoder.layers):
+
                 print("Layer: " + str(layer_idx))
                 interpolated_params = interpolated_params_list[layer_idx]
 
@@ -252,6 +255,8 @@ class ModelProjectionUtils:
                     if name not in interpolated_params:
                         continue
                     print(name)
+
+                    full_name = f"model.decoder.layers.{layer_idx}.{name}"
                     param_small = interpolated_params[name]
 
                     if param_small.shape == param_large.shape:
@@ -268,10 +273,12 @@ class ModelProjectionUtils:
                                 name=name
                             )
                         else:
+                            target_param = self.large_state_dict[full_name].to(param_small.device)
                             projected_param = self.dispatch_projection(
                                 name=name,
                                 W_small=param_small,
                                 target_shape=param_large.shape,
+                                target_param=target_param,
                                 projection_rank=rank
                             )
                             param_large.data.copy_(projected_param)
@@ -307,6 +314,7 @@ class ModelProjectionUtils:
                         name=name,
                         W_small=param_small,
                         target_shape=param_large.shape,
+                        target_param=param_large,
                         projection_rank=rank
                     )
                     self.large_state_dict[name] = projected_param

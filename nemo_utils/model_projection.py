@@ -22,38 +22,73 @@ class SymmetricProjectedLinear(nn.Module):
         self.register_buffer('W_small', W_small.clone().detach())
         self.A = nn.Parameter(torch.randn(d_large, rank) * 0.01)
         self.B = nn.Parameter(torch.randn(rank, d_small_out) * 0.01)
+        self._bias = None
 
     def forward(self, x):
-        P = self.A @ self.B                      # [d_large, d_small_out]
-        W_large = P @ self.W_small @ P.T         # [d_large, d_large]
-        return F.linear(x, W_large)
+        P = self.A @ self.B
+        W_large = P @ self.W_small @ P.T
+        return F.linear(x, W_large), self._bias
+
+    @property
+    def weight(self):
+        with torch.no_grad():
+            P = self.A @ self.B
+            return (P @ self.W_small @ P.T).detach()
+
+    @property
+    def bias(self):
+        return self._bias
+
 
 class AsymmetricProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_out_large: int, d_in_large: int, rank: int = 64):
         super().__init__()
         d_out_small, d_in_small = W_small.shape
         self.register_buffer('W_small', W_small.clone().detach())
-
         self.A1 = nn.Parameter(torch.randn(d_out_large, rank) * 0.01)
         self.A2 = nn.Parameter(torch.randn(rank, d_out_small) * 0.01)
         self.B1 = nn.Parameter(torch.randn(d_in_small, rank) * 0.01)
         self.B2 = nn.Parameter(torch.randn(rank, d_in_large) * 0.01)
+        self._bias = None
 
     def forward(self, x):
         W_large = (self.A1 @ (self.A2 @ self.W_small @ self.B1)) @ self.B2
-        return F.linear(x, W_large)
+        return F.linear(x, W_large), self._bias
+
+    @property
+    def weight(self):
+        with torch.no_grad():
+            return (self.A1 @ (self.A2 @ self.W_small @ self.B1) @ self.B2).detach()
+
+    @property
+    def bias(self):
+        return self._bias
+
 
 class QKVProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
         super().__init__()
-        self.qkv_small = torch.chunk(W_small.clone().detach(), 3, dim=0)  # [Q,K,V] small
+        self.qkv_small = torch.chunk(W_small.clone().detach(), 3, dim=0)
         self.projectors = nn.ModuleList([
             SymmetricProjectedLinear(qkv, d_large, rank) for qkv in self.qkv_small
         ])
 
     def forward(self, x):
-        outs = [proj(x) for proj in self.projectors]
-        return torch.cat(outs, dim=-1)  # [B, T, 3 * d_large]
+        outs = []
+        for proj in self.projectors:
+            out, _ = proj(x)  # all return (tensor, bias)
+            outs.append(out)
+        return torch.cat(outs, dim=-1), None
+
+    @property
+    def weight(self):
+        with torch.no_grad():
+            return torch.cat([proj.weight for proj in self.projectors], dim=0)
+
+    @property
+    def bias(self):
+        return None
+
 
 def get_projector_module(W_small, target_shape, rank, name):
     if "self_attention.linear_qkv" in name:

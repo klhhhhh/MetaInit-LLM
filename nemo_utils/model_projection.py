@@ -25,15 +25,18 @@ class SymmetricProjectedLinear(nn.Module):
         self._bias = None
 
     def forward(self, x):
-        P = self.A @ self.B
-        W_large = P @ self.W_small @ P.T
+        dtype = x.dtype
+        W_s = self.W_small.to(dtype)
+        P = (self.A @ self.B).to(dtype)
+        W_large = P @ W_s @ P.T
         return F.linear(x, W_large), self._bias
 
     @property
     def weight(self):
         with torch.no_grad():
-            P = self.A @ self.B
-            return (P @ self.W_small @ P.T).detach()
+            dtype = self.A.dtype
+            P = (self.A @ self.B).to(dtype)
+            return (P @ self.W_small.to(dtype) @ P.T).detach()
 
     @property
     def bias(self):
@@ -45,20 +48,27 @@ class AsymmetricProjectedLinear(nn.Module):
         super().__init__()
         d_out_small, d_in_small = W_small.shape
         self.register_buffer('W_small', W_small.clone().detach())
-        self.A1 = nn.Parameter(torch.randn(d_out_large, rank) * 0.01)
-        self.A2 = nn.Parameter(torch.randn(rank, d_out_small) * 0.01)
-        self.B1 = nn.Parameter(torch.randn(d_in_small, rank) * 0.01)
-        self.B2 = nn.Parameter(torch.randn(rank, d_in_large) * 0.01)
+        self.A_out = nn.Parameter(torch.randn(d_out_large, rank) * 0.01)
+        self.B_out = nn.Parameter(torch.randn(rank, d_out_small) * 0.01)
+        self.A_in = nn.Parameter(torch.randn(d_in_large, rank) * 0.01)
+        self.B_in = nn.Parameter(torch.randn(rank, d_in_small) * 0.01)
         self._bias = None
 
     def forward(self, x):
-        W_large = (self.A1 @ (self.A2 @ self.W_small @ self.B1)) @ self.B2
+        dtype = x.dtype
+        W_s = self.W_small.to(dtype)
+        P_out = (self.A_out @ self.B_out).to(dtype)
+        P_in = (self.A_in @ self.B_in).to(dtype)
+        W_large = P_out @ W_s @ P_in.T
         return F.linear(x, W_large), self._bias
 
     @property
     def weight(self):
         with torch.no_grad():
-            return (self.A1 @ (self.A2 @ self.W_small @ self.B1) @ self.B2).detach()
+            dtype = self.A_out.dtype
+            P_out = (self.A_out @ self.B_out).to(dtype)
+            P_in = (self.A_in @ self.B_in).to(dtype)
+            return (P_out @ self.W_small.to(dtype) @ P_in.T).detach()
 
     @property
     def bias(self):
@@ -68,6 +78,7 @@ class AsymmetricProjectedLinear(nn.Module):
 class QKVProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
         super().__init__()
+        assert W_small.shape[0] % 3 == 0, "QKV weight shape must be divisible by 3"
         self.qkv_small = torch.chunk(W_small.clone().detach(), 3, dim=0)
         self.projectors = nn.ModuleList([
             SymmetricProjectedLinear(qkv, d_large, rank) for qkv in self.qkv_small
@@ -76,14 +87,15 @@ class QKVProjectedLinear(nn.Module):
     def forward(self, x):
         outs = []
         for proj in self.projectors:
-            out, _ = proj(x)  # all return (tensor, bias)
-            outs.append(out)
+            out, _ = proj(x)  # Each returns (batch, seq, hidden)
+            outs.append(out.to(x.dtype))
         return torch.cat(outs, dim=-1), None
 
     @property
     def weight(self):
         with torch.no_grad():
-            return torch.cat([proj.weight for proj in self.projectors], dim=0)
+            dtype = self.projectors[0].A.dtype
+            return torch.cat([proj.weight.to(dtype) for proj in self.projectors], dim=0)  
 
     @property
     def bias(self):

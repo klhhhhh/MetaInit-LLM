@@ -18,25 +18,29 @@ from nemo_utils.model_builder import build_model
 class SymmetricProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
         super().__init__()
-        d_small_out, d_small_in = W_small.shape
-        self.register_buffer('W_small', W_small.clone().detach())
-        self.A = nn.Parameter(torch.randn(d_large, rank) * 0.01)
-        self.B = nn.Parameter(torch.randn(rank, d_small_out) * 0.01)
+        dtype = W_small.dtype
+        print("Dtype of W_small:", dtype)
+        self.register_buffer('W_small', W_small.clone().detach().to(dtype))
+        d_small_out, _ = W_small.shape
+        self.A = nn.Parameter(torch.randn(d_large, rank, dtype=dtype) * 0.01)
+        self.B = nn.Parameter(torch.randn(rank, d_small_out, dtype=dtype) * 0.01)
         self._bias = None
 
     def forward(self, x):
         dtype = x.dtype
         W_s = self.W_small.to(dtype)
-        P = (self.A @ self.B).to(dtype)
-        W_large = P @ W_s @ P.T
+        A = self.A.to(dtype)
+        B = self.B.to(dtype)
+        P = A @ B
+        W_large = P @ W_s @ P.transpose(-1, -2)
         return F.linear(x, W_large), self._bias
 
     @property
     def weight(self):
         with torch.no_grad():
-            dtype = self.A.dtype
-            P = (self.A @ self.B).to(dtype)
-            return (P @ self.W_small.to(dtype) @ P.T).detach()
+            dtype = self.W_small.dtype
+            P = self.A.to(dtype) @ self.B.to(dtype)
+            return (P @ self.W_small @ P.T).detach()
 
     @property
     def bias(self):
@@ -46,61 +50,65 @@ class SymmetricProjectedLinear(nn.Module):
 class AsymmetricProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_out_large: int, d_in_large: int, rank: int = 64):
         super().__init__()
+        dtype = W_small.dtype
+        print("Dtype of W_small:", dtype)
+        self.register_buffer('W_small', W_small.clone().detach().to(dtype))
         d_out_small, d_in_small = W_small.shape
-        self.register_buffer('W_small', W_small.clone().detach())
-        self.A_out = nn.Parameter(torch.randn(d_out_large, rank) * 0.01)
-        self.B_out = nn.Parameter(torch.randn(rank, d_out_small) * 0.01)
-        self.A_in = nn.Parameter(torch.randn(d_in_large, rank) * 0.01)
-        self.B_in = nn.Parameter(torch.randn(rank, d_in_small) * 0.01)
+        self.A_out = nn.Parameter(torch.randn(d_out_large, rank, dtype=dtype) * 0.01)
+        self.B_out = nn.Parameter(torch.randn(rank, d_out_small, dtype=dtype) * 0.01)
+        self.A_in = nn.Parameter(torch.randn(d_in_large, rank, dtype=dtype) * 0.01)
+        self.B_in = nn.Parameter(torch.randn(rank, d_in_small, dtype=dtype) * 0.01)
         self._bias = None
 
     def forward(self, x):
         dtype = x.dtype
         W_s = self.W_small.to(dtype)
-        P_out = (self.A_out @ self.B_out).to(dtype)
-        P_in = (self.A_in @ self.B_in).to(dtype)
-        W_large = P_out @ W_s @ P_in.T
+        A_out = self.A_out.to(dtype)
+        B_out = self.B_out.to(dtype)
+        A_in = self.A_in.to(dtype)
+        B_in = self.B_in.to(dtype)
+        P_out = A_out @ B_out
+        P_in = A_in @ B_in
+        W_large = P_out @ W_s @ P_in.transpose(-1, -2)
         return F.linear(x, W_large), self._bias
 
     @property
     def weight(self):
         with torch.no_grad():
-            dtype = self.A_out.dtype
-            P_out = (self.A_out @ self.B_out).to(dtype)
-            P_in = (self.A_in @ self.B_in).to(dtype)
-            return (P_out @ self.W_small.to(dtype) @ P_in.T).detach()
+            dtype = self.W_small.dtype
+            P_out = self.A_out.to(dtype) @ self.B_out.to(dtype)
+            P_in = self.A_in.to(dtype) @ self.B_in.to(dtype)
+            return (P_out @ self.W_small @ P_in.T).detach()
 
     @property
     def bias(self):
         return self._bias
 
-
 class QKVProjectedLinear(nn.Module):
     def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
         super().__init__()
         assert W_small.shape[0] % 3 == 0, "QKV weight shape must be divisible by 3"
-        self.qkv_small = torch.chunk(W_small.clone().detach(), 3, dim=0)
+        qkv_chunks = torch.chunk(W_small.clone().detach(), 3, dim=0)
         self.projectors = nn.ModuleList([
-            SymmetricProjectedLinear(qkv, d_large, rank) for qkv in self.qkv_small
+            SymmetricProjectedLinear(qkv, d_large, rank) for qkv in qkv_chunks
         ])
 
     def forward(self, x):
         outs = []
         for proj in self.projectors:
-            out, _ = proj(x)  # Each returns (batch, seq, hidden)
-            outs.append(out.to(x.dtype))
+            out, _ = proj(x)
+            outs.append(out)
         return torch.cat(outs, dim=-1), None
 
     @property
     def weight(self):
         with torch.no_grad():
-            dtype = self.projectors[0].A.dtype
-            return torch.cat([proj.weight.to(dtype) for proj in self.projectors], dim=0)  
+            dtype = self.projectors[0].W_small.dtype
+            return torch.cat([proj.weight.to(dtype) for proj in self.projectors], dim=0)
 
     @property
     def bias(self):
         return None
-
 
 def get_projector_module(W_small, target_shape, rank, name):
     if "self_attention.linear_qkv" in name:

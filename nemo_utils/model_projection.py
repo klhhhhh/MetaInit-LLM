@@ -16,10 +16,9 @@ from nemo_utils.model_loader import load_model_to_cpu
 from nemo_utils.model_builder import build_model
 
 class SymmetricProjectedLinear(nn.Module):
-    def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
+    def __init__(self, W_small: torch.Tensor, dtype, d_large: int, rank: int = 64):
         super().__init__()
-        dtype = W_small.dtype
-        print("Dtype of W_small:", dtype)
+        self.dtype = dtype
         self.register_buffer('W_small', W_small.clone().detach().to(dtype))
         d_small_out, _ = W_small.shape
         self.A = nn.Parameter(torch.randn(d_large, rank, dtype=dtype) * 0.01)
@@ -27,31 +26,28 @@ class SymmetricProjectedLinear(nn.Module):
         self._bias = None
 
     def forward(self, x):
-        dtype = x.dtype
-        W_s = self.W_small.to(dtype)
-        A = self.A.to(dtype)
-        B = self.B.to(dtype)
-        P = A @ B
-        W_large = P @ W_s @ P.transpose(-1, -2)
-        return F.linear(x, W_large), self._bias
+        with torch.autocast(device_type='cuda' if x.is_cuda else 'cpu', enabled=False):
+            W_s = self.W_small.to(self.dtype)
+            A = self.A.to(self.dtype)
+            B = self.B.to(self.dtype)
+            P = A @ B
+            W_large = P @ W_s @ P.transpose(-1, -2)
+            return F.linear(x, W_large), self._bias
 
     @property
     def weight(self):
-        with torch.no_grad():
-            dtype = self.W_small.dtype
-            P = self.A.to(dtype) @ self.B.to(dtype)
+        with torch.no_grad(), torch.autocast(device_type='cuda' if self.A.is_cuda else 'cpu', enabled=False):
+            P = self.A.to(self.dtype) @ self.B.to(self.dtype)
             return (P @ self.W_small @ P.T).detach()
 
     @property
     def bias(self):
         return self._bias
 
-
 class AsymmetricProjectedLinear(nn.Module):
-    def __init__(self, W_small: torch.Tensor, d_out_large: int, d_in_large: int, rank: int = 64):
+    def __init__(self, W_small: torch.Tensor, dtype, d_out_large: int, d_in_large: int, rank: int = 64):
         super().__init__()
-        dtype = W_small.dtype
-        print("Dtype of W_small:", dtype)
+        self.dtype = dtype
         self.register_buffer('W_small', W_small.clone().detach().to(dtype))
         d_out_small, d_in_small = W_small.shape
         self.A_out = nn.Parameter(torch.randn(d_out_large, rank, dtype=dtype) * 0.01)
@@ -61,23 +57,22 @@ class AsymmetricProjectedLinear(nn.Module):
         self._bias = None
 
     def forward(self, x):
-        dtype = x.dtype
-        W_s = self.W_small.to(dtype)
-        A_out = self.A_out.to(dtype)
-        B_out = self.B_out.to(dtype)
-        A_in = self.A_in.to(dtype)
-        B_in = self.B_in.to(dtype)
-        P_out = A_out @ B_out
-        P_in = A_in @ B_in
-        W_large = P_out @ W_s @ P_in.transpose(-1, -2)
-        return F.linear(x, W_large), self._bias
+        with torch.autocast(device_type='cuda' if x.is_cuda else 'cpu', enabled=False):
+            W_s = self.W_small.to(self.dtype)
+            A_out = self.A_out.to(self.dtype)
+            B_out = self.B_out.to(self.dtype)
+            A_in = self.A_in.to(self.dtype)
+            B_in = self.B_in.to(self.dtype)
+            P_out = A_out @ B_out
+            P_in = A_in @ B_in
+            W_large = P_out @ W_s @ P_in.transpose(-1, -2)
+            return F.linear(x, W_large), self._bias
 
     @property
     def weight(self):
-        with torch.no_grad():
-            dtype = self.W_small.dtype
-            P_out = self.A_out.to(dtype) @ self.B_out.to(dtype)
-            P_in = self.A_in.to(dtype) @ self.B_in.to(dtype)
+        with torch.no_grad(), torch.autocast(device_type='cuda' if self.A_out.is_cuda else 'cpu', enabled=False):
+            P_out = self.A_out.to(self.dtype) @ self.B_out.to(self.dtype)
+            P_in = self.A_in.to(self.dtype) @ self.B_in.to(self.dtype)
             return (P_out @ self.W_small @ P_in.T).detach()
 
     @property
@@ -85,51 +80,51 @@ class AsymmetricProjectedLinear(nn.Module):
         return self._bias
 
 class QKVProjectedLinear(nn.Module):
-    def __init__(self, W_small: torch.Tensor, d_large: int, rank: int = 64):
+    def __init__(self, W_small: torch.Tensor, dtype, d_large: int, rank: int = 64):
         super().__init__()
+        self.dtype = dtype
         assert W_small.shape[0] % 3 == 0, "QKV weight shape must be divisible by 3"
         qkv_chunks = torch.chunk(W_small.clone().detach(), 3, dim=0)
         self.projectors = nn.ModuleList([
-            SymmetricProjectedLinear(qkv, d_large, rank) for qkv in qkv_chunks
+            SymmetricProjectedLinear(qkv, dtype=dtype, d_large=d_large, rank=rank) for qkv in qkv_chunks
         ])
 
     def forward(self, x):
-        outs = []
-        for proj in self.projectors:
-            out, _ = proj(x)
-            outs.append(out)
-        return torch.cat(outs, dim=-1), None
+        with torch.autocast(device_type='cuda' if x.is_cuda else 'cpu', enabled=False):
+            outs = []
+            for proj in self.projectors:
+                out, _ = proj(x)
+                outs.append(out)
+            return torch.cat(outs, dim=-1), None
 
     @property
     def weight(self):
-        with torch.no_grad():
-            dtype = self.projectors[0].W_small.dtype
-            return torch.cat([proj.weight.to(dtype) for proj in self.projectors], dim=0)
+        with torch.no_grad(), torch.autocast(device_type='cuda' if self.projectors[0].A.is_cuda else 'cpu', enabled=False):
+            return torch.cat([proj.weight.to(self.dtype) for proj in self.projectors], dim=0)
 
     @property
     def bias(self):
         return None
 
-def get_projector_module(W_small, target_shape, rank, name):
-    if "self_attention.linear_qkv" in name:
-        return QKVProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
-    elif "self_attention.linear_proj" in name:
-        return SymmetricProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
-    elif "mlp.linear_fc" in name:
-        return AsymmetricProjectedLinear(
-            W_small, d_out_large=target_shape[0], d_in_large=target_shape[1], rank=rank
-        )
-    else:
-        raise ValueError(f"Unsupported projection layer for name: {name}")
-
 class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
-        self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager = self._load_large_model(large_model_cfg_path)
+        self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager, self.dtype = self._load_large_model(large_model_cfg_path)
+        self._set_dtype(self.dtype)
         print("=== Large Model State Dict Keys ===")
         print(self.large_state_dict.keys())
         self.lora_modules = {}  # name → LoRA projector
+
+    def _set_dtype(self, dtype):
+        """ Set the dtype based on the precision string. """
+        precision_str = str(dtype).lower()
+        if precision_str in ["bf16", "bf16-mixed"]:
+            self.dtype = torch.bfloat16
+        elif precision_str in ["16", "fp16", "16-mixed"]:
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32
 
     def _load_small_model(self, path):
         if self.device == "cpu":
@@ -139,8 +134,8 @@ class ModelProjectionUtils:
         return model
 
     def _load_large_model(self, cfg_name):
-        large_model, trainer, exp_manager = build_model(cfg_name)
-        return large_model, large_model.state_dict(), trainer, exp_manager
+        large_model, trainer, exp_manager, dtype= build_model(cfg_name)
+        return large_model, large_model.state_dict(), trainer, exp_manager, dtype
     
     def get_large_model_trainer(self):
         """
@@ -181,7 +176,7 @@ class ModelProjectionUtils:
             expanded_params.append(interpolated_layer_params)
 
         return expanded_params
-        
+
     def normalize_projection(self, W_projected, W_target):
         """
         Normalize the projected weight matrix to match the Frobenius norm of the target matrix.
@@ -269,13 +264,13 @@ class ModelProjectionUtils:
         W_large = self.normalize_projection(W_large, target_param)
         return W_large
 
-    def replace_with_projected_linear(self, parent_module, attr_name, W_small, target_shape, rank, name):
+    def replace_with_projected_linear(self, parent_module, attr_name, W_small, target_shape, target_dtype, rank, name):
         if "linear_qkv" in name:
-            projector = QKVProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
+            projector = QKVProjectedLinear(W_small, dtype=target_dtype , d_large=target_shape[1], rank=rank)
         elif "linear_proj" in name:
-            projector = SymmetricProjectedLinear(W_small, d_large=target_shape[1], rank=rank)
+            projector = SymmetricProjectedLinear(W_small, dtype=target_dtype, d_large=target_shape[1], rank=rank)
         elif "mlp" in name:
-            projector = AsymmetricProjectedLinear(W_small, d_out_large=target_shape[0], d_in_large=target_shape[1], rank=rank)
+            projector = AsymmetricProjectedLinear(W_small, dtype=target_dtype, d_out_large=target_shape[0], d_in_large=target_shape[1], rank=rank)
         else:
             raise ValueError(f"Unknown layer for projector replacement: {name}")
         setattr(parent_module, attr_name, projector)
@@ -324,6 +319,7 @@ class ModelProjectionUtils:
                                 attr_name=name.split(".")[1],
                                 W_small=param_small,
                                 target_shape=param_large.shape,
+                                target_dtype=self.dtype,
                                 rank=rank,
                                 name=name
                             )

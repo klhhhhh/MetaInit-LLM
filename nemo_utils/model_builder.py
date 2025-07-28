@@ -28,13 +28,15 @@ def build_model(cfg_name, map_location="cpu"):
 
     logging.info("************** Initializing Model **************")
 
+    dtype = cfg.trainer.precision
+
     # Setup trainer
     trainer = MegatronTrainerBuilder(cfg).create_trainer()
 
     # Instantiate the model
     model = MegatronGPTModel(cfg.model, trainer)
 
-    return model, trainer, cfg.exp_manager
+    return model, trainer, cfg.exp_manager, dtype
 
 if __name__ == "__main__":
 

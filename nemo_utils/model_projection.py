@@ -26,17 +26,20 @@ class SymmetricProjectedLinear(nn.Module):
         self._bias = None
 
     def forward(self, x):
-        with torch.autocast(device_type='cuda' if x.is_cuda else 'cpu', enabled=False):
-            W_s = self.W_small.to(self.dtype)
-            A = self.A.to(self.dtype)
-            B = self.B.to(self.dtype)
-            P = A @ B
-            W_large = P @ W_s @ P.transpose(-1, -2)
-            return F.linear(x, W_large), self._bias
+        print("Dtype in forward:", self.dtype)
+        W_s = self.W_small.to(self.dtype)
+        A = self.A.to(self.dtype)
+        B = self.B.to(self.dtype)
+        P = A @ B
+        W_large = P @ W_s @ P.transpose(-1, -2)
+        x = x.to(self.dtype)
+        output = F.linear(x, W_large)
+        print("Output dtype:", output.dtype)
+        return output, self._bias
 
     @property
     def weight(self):
-        with torch.no_grad(), torch.autocast(device_type='cuda' if self.A.is_cuda else 'cpu', enabled=False):
+        with torch.no_grad():
             P = self.A.to(self.dtype) @ self.B.to(self.dtype)
             return (P @ self.W_small @ P.T).detach()
 
@@ -57,20 +60,23 @@ class AsymmetricProjectedLinear(nn.Module):
         self._bias = None
 
     def forward(self, x):
-        with torch.autocast(device_type='cuda' if x.is_cuda else 'cpu', enabled=False):
-            W_s = self.W_small.to(self.dtype)
-            A_out = self.A_out.to(self.dtype)
-            B_out = self.B_out.to(self.dtype)
-            A_in = self.A_in.to(self.dtype)
-            B_in = self.B_in.to(self.dtype)
-            P_out = A_out @ B_out
-            P_in = A_in @ B_in
-            W_large = P_out @ W_s @ P_in.transpose(-1, -2)
-            return F.linear(x, W_large), self._bias
+        print("Dtype in forward:", self.dtype)
+        W_s = self.W_small.to(self.dtype)
+        A_out = self.A_out.to(self.dtype)
+        B_out = self.B_out.to(self.dtype)
+        A_in = self.A_in.to(self.dtype)
+        B_in = self.B_in.to(self.dtype)
+        P_out = A_out @ B_out
+        P_in = A_in @ B_in
+        W_large = P_out @ W_s @ P_in.transpose(-1, -2)
+        x = x.to(self.dtype)
+        output = F.linear(x, W_large)
+        print("Output dtype:", output.dtype)
+        return output, self._bias
 
     @property
     def weight(self):
-        with torch.no_grad(), torch.autocast(device_type='cuda' if self.A_out.is_cuda else 'cpu', enabled=False):
+        with torch.no_grad():
             P_out = self.A_out.to(self.dtype) @ self.B_out.to(self.dtype)
             P_in = self.A_in.to(self.dtype) @ self.B_in.to(self.dtype)
             return (P_out @ self.W_small @ P_in.T).detach()
@@ -90,16 +96,16 @@ class QKVProjectedLinear(nn.Module):
         ])
 
     def forward(self, x):
-        with torch.autocast(device_type='cuda' if x.is_cuda else 'cpu', enabled=False):
-            outs = []
-            for proj in self.projectors:
-                out, _ = proj(x)
-                outs.append(out)
-            return torch.cat(outs, dim=-1), None
+        outs = []
+        for proj in self.projectors:
+            out, _ = proj(x)
+            outs.append(out)
+        print("Dtype in forward:", torch.cat(outs, dim=-1).dtype)
+        return torch.cat(outs, dim=-1), None
 
     @property
     def weight(self):
-        with torch.no_grad(), torch.autocast(device_type='cuda' if self.projectors[0].A.is_cuda else 'cpu', enabled=False):
+        with torch.no_grad():
             return torch.cat([proj.weight.to(self.dtype) for proj in self.projectors], dim=0)
 
     @property

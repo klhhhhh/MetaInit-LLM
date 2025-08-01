@@ -1,4 +1,4 @@
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,6 +78,81 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         return W_proj
 
     def forward(self, input_, weight=None, runtime_gather_output=None):
+
         if self.projector_enabled:
             weight = self.get_projected_weight()
+
         return super().forward(input_, weight=weight, runtime_gather_output=runtime_gather_output)
+
+
+class RowParallelLinearWithProjector(RowParallelLinear):
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        *,
+        config,
+        init_method,
+        W_small: torch.Tensor,  # Small model weights
+        rank: int = 64,         # Projection rank
+        symmetric: bool = True, # Projection method
+        bias=True,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        stride: int = 1,
+        keep_master_weight_for_test: bool = False,
+        is_expert: bool = False,
+        tp_comm_buffer_name: str = None,  # Not used
+    ):
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            input_is_parallel=input_is_parallel,
+            skip_bias_add=skip_bias_add,
+            stride=stride,
+            keep_master_weight_for_test=keep_master_weight_for_test,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name
+        )
+
+        self.projector_enabled = True
+        self.symmetric = symmetric
+        self.dtype = config.params_dtype
+
+        # Save the weights of the small model
+        d_out_small, d_in_small = W_small.shape
+        self.register_buffer('W_small', W_small.clone().detach().to(self.dtype))
+
+        d_out_large, d_in_large = self.output_size_per_partition, input_size
+
+        if symmetric:
+            self.A = nn.Parameter(torch.randn(rank, d_out_large, dtype=self.dtype) * 0.01)
+            self.B = nn.Parameter(torch.randn(d_out_small, rank, dtype=self.dtype) * 0.01)
+        else:
+            self.A_out = nn.Parameter(torch.randn(rank, d_out_large, dtype=self.dtype) * 0.01)
+            self.B_out = nn.Parameter(torch.randn(d_out_small, rank, dtype=self.dtype) * 0.01)
+            self.A_in = nn.Parameter(torch.randn(rank, d_in_large, dtype=self.dtype) * 0.01)
+            self.B_in = nn.Parameter(torch.randn(d_in_small, rank, dtype=self.dtype) * 0.01)
+    
+    def get_projected_weight(self):
+        W_s = self.W_small.to(self.dtype)
+
+        if self.symmetric:
+            P = self.A @ self.B  # (rank, d_out_small)
+            W_proj = P.T @ W_s @ P # (d_in_large, d_out_large)
+        else:
+            P_out = self.A_out @ self.B_out  # (rank, d_out_small)
+            P_in = self.A_in @ self.B_in     # (rank, d_in_small)
+            W_proj = P_in.T @ W_s @ P_out  # (d_in_large, d_out_large)
+      
+        return W_proj
+
+    def forward(self, input_):
+
+        if self.projector_enabled:
+            self.weight = self.get_projected_weight()
+        
+        return super().forward(input_)

@@ -12,9 +12,9 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         *,
         config,
         init_method,
-        W_small: torch.Tensor,  # Small model weights
-        rank: int = 64,         # Projection rank
-        symmetric: bool = True, # Projection method
+        W_small: torch.Tensor,
+        rank: int = 64,
+        projection_type: str = "symmetric",  # ["symmetric", "asymmetric", "qkv"]
         bias=True,
         gather_output=False,
         stride=1,
@@ -46,42 +46,76 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         )
 
         self.projector_enabled = True
-        self.symmetric = symmetric
+        self.projection_type = projection_type
         self.dtype = config.params_dtype
 
-        # Save the weights of the small model
-        d_out_small, d_in_small = W_small.shape
         self.register_buffer('W_small', W_small.clone().detach().to(self.dtype))
 
         d_out_large, d_in_large = self.output_size_per_partition, input_size
+        d_out_small, d_in_small = W_small.shape
 
-        if symmetric:
+        if projection_type == "symmetric":
             self.A = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
             self.B = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
-        else:
+
+        elif projection_type == "asymmetric":
             self.A_out = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
             self.B_out = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
-            self.A_in = nn.Parameter(torch.randn(d_in_large, rank, dtype=self.dtype) * 0.01)
-            self.B_in = nn.Parameter(torch.randn(rank, d_in_small, dtype=self.dtype) * 0.01)
+            self.A_in  = nn.Parameter(torch.randn(d_in_large, rank, dtype=self.dtype) * 0.01)
+            self.B_in  = nn.Parameter(torch.randn(rank, d_in_small, dtype=self.dtype) * 0.01)
+
+        elif projection_type == "qkv":
+            # Assume each q/k/v small matrix is square
+            d_total_small = W_small.shape[0]
+            assert d_total_small % 3 == 0, "QKV projection requires W_small divisible by 3"
+            d_single_small = d_total_small // 3
+            d_single_large = d_out_large // 3
+
+            self.q_proj = self._init_symmetric_proj(rank, d_single_large, d_single_small)
+            self.k_proj = self._init_symmetric_proj(rank, d_single_large, d_single_small)
+            self.v_proj = self._init_symmetric_proj(rank, d_single_large, d_single_small)
+
+        else:
+            raise ValueError(f"Unsupported projection_type: {projection_type}")
+
+    def _init_symmetric_proj(self, rank, d_large, d_small):
+        return nn.ParameterDict({
+            'A': nn.Parameter(torch.randn(d_large, rank, dtype=self.dtype) * 0.01),
+            'B': nn.Parameter(torch.randn(rank, d_small, dtype=self.dtype) * 0.01),
+        })
 
     def get_projected_weight(self):
         W_s = self.W_small.to(self.dtype)
 
-        if self.symmetric:
-            P = self.A @ self.B  # (d_out_large, d_out_small)
-            W_proj = P @ W_s @ P.T  # (d_out_large, d_in_large)
-        else:
-            P_out = self.A_out @ self.B_out  # (d_out_large, d_out_small)
-            P_in = self.A_in @ self.B_in     # (d_in_large, d_in_small)
-            W_proj = P_out @ W_s @ P_in.T    # (d_out_large, d_in_large)
+        if self.projection_type == "symmetric":
+            P = self.A @ self.B
+            return P @ W_s @ P.T
 
-        return W_proj
+        elif self.projection_type == "asymmetric":
+            P_out = self.A_out @ self.B_out
+            P_in  = self.A_in @ self.B_in
+            return P_out @ W_s @ P_in.T
+
+        elif self.projection_type == "qkv":
+            W_q, W_k, W_v = torch.chunk(W_s, 3, dim=0)
+
+            def project(W, proj):
+                P = proj['A'] @ proj['B']
+                return P @ W @ P.T
+
+            W_q_proj = project(W_q, self.q_proj)
+            W_k_proj = project(W_k, self.k_proj)
+            W_v_proj = project(W_v, self.v_proj)
+
+            return torch.cat([W_q_proj, W_k_proj, W_v_proj], dim=0)
+
+        else:
+            raise NotImplementedError
 
     def forward(self, input_, weight=None, runtime_gather_output=None):
 
         if self.projector_enabled:
             weight = self.get_projected_weight()
-
         return super().forward(input_, weight=weight, runtime_gather_output=runtime_gather_output)
 
 class RowParallelLinearWithProjector(RowParallelLinear):

@@ -1,3 +1,11 @@
+import os
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import logging
 import torch
 
@@ -6,6 +14,9 @@ from omegaconf import OmegaConf
 from hydra import initialize_config_dir, compose
 from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronTrainerBuilder
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from nemo_utils.init_hook import patch_layer
 
 def build_model(cfg_name, map_location="cpu"):
     """
@@ -32,6 +43,10 @@ def build_model(cfg_name, map_location="cpu"):
 
     # Setup trainer
     trainer = MegatronTrainerBuilder(cfg).create_trainer()
+
+    #Patch the ColumnParallelLinear and RowParallelLinear classes
+    patch_layer(ColumnParallelLinear, "ColumnParallelLinear")
+    patch_layer(RowParallelLinear, "RowParallelLinear")
 
     # Instantiate the model
     model = MegatronGPTModel(cfg.model, trainer)

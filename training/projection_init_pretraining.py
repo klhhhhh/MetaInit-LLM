@@ -12,7 +12,7 @@ from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 
-from nemo_utils.model_projection import ModelProjectionUtils
+from projection.model_projection import ModelProjectionUtils
 
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))

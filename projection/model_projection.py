@@ -293,15 +293,23 @@ class ModelProjectionUtils:
     #     setattr(parent_module, attr_name, projector) 
     #     print(f"[Learnable] Replaced {attr_name} in {name} with {projector.__class__.__name__}")
     
-    def replace_layer_with_projector(self, parent_module, attr_name, W_small, target_shape, target_dtype, rank, name):
-        
+    def replace_layer_with_projector(
+        self,
+        parent_module,
+        attr_name,
+        W_small: torch.Tensor,
+        target_shape,          # (out, in) — can be used for sanity check
+        target_dtype,          # could be torch.bfloat16 / torch.float16 / torch.float32
+        rank: int,
+        name: str,
+    ):
+        # Dependency import
         from nemo_utils.init_hook import INIT_RECORDS
 
+        # Retrieve the old layer object
         layer = getattr(parent_module, attr_name)
 
-        if layer not in INIT_RECORDS:
-            raise ValueError(f"Cannot find init args for layer {layer} in INIT_RECORDS. Make sure the layer was recorded.")
-
+        # 1) Determine the projection type based on the name
         if "linear_qkv" in name:
             projection_type = "qkv"
         elif "linear_proj" in name:
@@ -311,23 +319,65 @@ class ModelProjectionUtils:
         else:
             raise ValueError(f"Unknown layer for projector replacement: {name}")
 
+        # 2) Retrieve initialization parameters from INIT_RECORDS
+        if layer not in INIT_RECORDS:
+            # Provide a more readable error, suggesting wrapping the constructor with a recorder
+            raise ValueError(
+                f"Cannot find init args for layer {layer} in INIT_RECORDS. "
+                f"Make sure ColumnParallelLinear/RowParallelLinear __init__ is wrapped and recorded."
+            )
+
         init_args, init_kwargs = INIT_RECORDS[layer]
-        
-        # Inject projector-specific arguments
-        init_kwargs = dict(init_kwargs)  # clone to avoid mutation
+        init_kwargs = dict(init_kwargs)  # Avoid modifying the original record
+
+        # 3) Align dtype/device (based on the existing layer's config)
+        params_dtype = getattr(layer.config, "params_dtype", target_dtype)
+        device = layer.weight.device if getattr(layer, "weight", None) is not None else torch.cuda.current_device()
+
+        W_small = W_small.to(device=device, dtype=params_dtype)
+
+        # 4) Additional qkv checks (to avoid shape issues later)
+        if projection_type == "qkv":
+            # output_size (out_per_partition for column-parallel) and W_small's first dimension must both be divisible by 3
+            out_dim = target_shape[0] if isinstance(layer, ColumnParallelLinear) else target_shape[0]
+            if (out_dim % 3) != 0 or (W_small.shape[0] % 3) != 0:
+                raise ValueError(
+                    f"QKV projection requires output dim and W_small rows divisible by 3, "
+                    f"got out={out_dim}, W_small_rows={W_small.shape[0]}"
+                )
+
+        # 5) Inject projector parameters
         init_kwargs["W_small"] = W_small
         init_kwargs["rank"] = rank
         init_kwargs["projection_type"] = projection_type
 
-        # Check layer type and construct projector-enhanced version
+        # 6) Construct the new layer
         if isinstance(layer, ColumnParallelLinear):
             new_layer = ColumnParallelLinearWithProjector(*init_args, **init_kwargs)
         elif isinstance(layer, RowParallelLinear):
+            # Ensure the constructor signature and kwargs naming match your implementation
             new_layer = RowParallelLinearWithProjector(*init_args, **init_kwargs)
         else:
             raise TypeError(f"Unsupported layer type: {type(layer)}")
 
-        setattr(parent_module, attr_name, new_layer) 
+        # 7) Copy the bias values from the old layer (if dimensions match)
+        #    Note: The WithProjector class will recreate the bias param in super().__init__
+        try:
+            if getattr(layer, "bias", None) is not None and getattr(new_layer, "bias", None) is not None:
+                if layer.bias.shape == new_layer.bias.shape:
+                    with torch.no_grad():
+                        new_layer.bias.data.copy_(layer.bias.data.to(dtype=params_dtype, device=device))
+        except Exception as e:
+            # Non-critical, just print a warning
+            print(f"[warn] bias copy skipped: {e}")
+
+        # 8) Finally, replace the old layer with the new one
+        setattr(parent_module, attr_name, new_layer)
+
+        # 9) Print key information for debugging
+        print(f"[Projector Replace] {name}: {type(layer).__name__} -> {type(new_layer).__name__} "
+            f"(proj={projection_type}, rank={rank}, dtype={params_dtype}, device={device})")
+
 
     def free_small_model(self):
         """

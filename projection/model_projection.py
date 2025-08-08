@@ -290,7 +290,69 @@ class ModelProjectionUtils:
     #     print("Type of Replaced Module:", type(getattr(parent_module, attr_name))) 
     #     setattr(parent_module, attr_name, projector) 
     #     print(f"[Learnable] Replaced {attr_name} in {name} with {projector.__class__.__name__}")
-    
+    def _bind_init_kwargs_from_record(self, layer, rec: dict) -> dict:
+        """
+        Build a kwargs dict for re-instantiation from INIT_RECORDS entry:
+        rec = {"class_name":..., "instance":..., "args": tuple, "kwargs": dict}
+        Falls back to attributes on the live layer when needed.
+        """
+        args = rec.get("args", ()) or ()
+        kwargs = rec.get("kwargs", {}) or {}
+
+        # Try binding to the layer class __init__ signature (to map positional -> names)
+        try:
+            sig = inspect.signature(layer.__class__.__init__)
+            ba = sig.bind_partial(layer, *args, **kwargs)  # include self
+            bound = {k: v for k, v in ba.arguments.items() if k != "self"}
+        except Exception:
+            # If binding fails, at least use the recorded kwargs
+            bound = dict(kwargs)
+
+        # Fill missing essentials from the live object
+        bound.setdefault("input_size", getattr(layer, "input_size", None))
+        bound.setdefault("output_size", getattr(layer, "output_size", None))
+        bound.setdefault("config", getattr(layer, "config", None))
+        # Column vs Row specifics
+        if isinstance(layer, ColumnParallelLinear):
+            bound.setdefault("gather_output", getattr(layer, "gather_output", False))
+            bound.setdefault("skip_bias_add", getattr(layer, "skip_bias_add", False))
+            bound.setdefault("stride", 1)
+            bound.setdefault("keep_master_weight_for_test", False)
+            bound.setdefault("skip_weight_param_allocation", False)
+            bound.setdefault("embedding_activation_buffer", getattr(layer, "embedding_activation_buffer", None))
+            bound.setdefault("grad_output_buffer", getattr(layer, "grad_output_buffer", None))
+            bound.setdefault("is_expert", getattr(layer, "is_expert", False))
+            bound.setdefault("tp_comm_buffer_name", None)
+            bound.setdefault("disable_grad_reduce", getattr(layer, "disable_grad_reduce", False))
+        elif isinstance(layer, RowParallelLinear):
+            bound.setdefault("input_is_parallel", getattr(layer, "input_is_parallel", False))
+            bound.setdefault("skip_bias_add", getattr(layer, "skip_bias_add", False))
+            bound.setdefault("stride", 1)
+            bound.setdefault("keep_master_weight_for_test", False)
+            bound.setdefault("is_expert", getattr(layer, "is_expert", False))
+            bound.setdefault("tp_comm_buffer_name", None)
+
+        # bias flag: original constructor expects a bool
+        if "bias" not in bound:
+            bound["bias"] = getattr(layer, "bias", None) is not None
+
+        # init_method: if not recorded, provide a sane default
+        if "init_method" not in bound or bound["init_method"] is None:
+            bound["init_method"] = torch.nn.init.xavier_uniform_
+
+        return bound
+
+
+    def _filter_kwargs_for_ctor(self, cls, kwargs: dict) -> dict:
+        """Keep only kwargs accepted by cls.__init__, drop the rest."""
+
+        import inspect
+
+        sig = inspect.signature(cls.__init__)
+        allowed = {p.name for p in sig.parameters.values()}
+        allowed.discard("self")
+        return {k: v for k, v in kwargs.items() if k in allowed}
+
     def replace_layer_with_projector(
         self,
         parent_module,
@@ -301,79 +363,77 @@ class ModelProjectionUtils:
         rank: int,
         name: str,
     ):
-        # --- Dependencies & types ---
         from nemo_utils.init_hook import INIT_RECORDS
-        # Retrieve the old layer object
+
         layer = getattr(parent_module, attr_name)
 
-        # --- 1) Determine projection type ---
+        # decide projection type
         if "linear_qkv" in name:
             projection_type = "qkv"
         elif "linear_proj" in name:
             projection_type = "symmetric"
-        elif ("mlp" in name) or ("fc1" in name) or ("fc2" in name):
+        elif "mlp" in name or "fc1" in name or "fc2" in name:
             projection_type = "asymmetric"
         else:
             raise ValueError(f"Unknown layer for projector replacement: {name}")
 
-        # --- 2) Read initialization parameters from INIT_RECORDS ---
-        key = id(layer)
-        if key not in INIT_RECORDS:
-            # Debugging information to help locate issues
-            print(f"[replace_layer_with_projector] layer id={key} not in INIT_RECORDS")
-            print(f"[replace_layer_with_projector] known keys sample={list(INIT_RECORDS.keys())[:5]}")
+        # fetch the record and rebuild kwargs
+        rec = INIT_RECORDS.get(id(layer))
+        if rec is None:
             raise ValueError(
-                f"Cannot find init args for layer {layer} in INIT_RECORDS. "
-                f"Make sure Column/Row __init__ was wrapped & recorded."
+                f"INIT_RECORDS has no entry for object id={id(layer)} ({type(layer).__name__}). "
+                "Make sure you patched the class BEFORE building the model."
             )
 
-        # Compatible with the current 4-tuple structure: (cls, qualname, init_args, init_kwargs)
-        rec = INIT_RECORDS[key]
-        if not (isinstance(rec, dict) and len(rec) == 4):
-            raise ValueError(f"INIT_RECORDS[{key}] unexpected format: {type(rec)} / len={len(rec)}")
-        _, _, init_args, init_kwargs = rec
-        if not isinstance(init_args, (tuple, dict)):
-            init_args = tuple(init_args) if init_args is not None else ()
-        init_kwargs = dict(init_kwargs) if isinstance(init_kwargs, dict) else {}
+        init_kwargs = self._bind_init_kwargs_from_record(layer, rec)
 
-        # --- 3) Align dtype/device ---
+        # dtype/device align
         params_dtype = getattr(layer.config, "params_dtype", target_dtype)
-        # Device is prioritized from the weight's device, then inferred from any parameter, and finally defaults to current CUDA device
-        if getattr(layer, "weight", None) is not None:
-            device = layer.weight.device
-        else:
-            try:
-                device = next(layer.parameters()).device
-            except StopIteration:
-                device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-
+        device = (
+            layer.weight.device
+            if getattr(layer, "weight", None) is not None
+            else (torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu"))
+        )
         W_small = W_small.to(device=device, dtype=params_dtype)
 
-        # --- 4) QKV dimension validation ---
-        # Column: weight shape = (out_per_partition, in). out_per_partition must be divisible by 3
-        # Row:    weight shape = (out, in_per_partition). out must be divisible by 3
+        # qkv sanity
         if projection_type == "qkv":
-            out_dim = target_shape[0]
+            out_dim = target_shape[0]  # ColumnParallelLinear: out_per_partition
             if (out_dim % 3) != 0 or (W_small.shape[0] % 3) != 0:
                 raise ValueError(
                     f"QKV projection requires output dim and W_small rows divisible by 3, "
                     f"got out={out_dim}, W_small_rows={W_small.shape[0]}"
                 )
 
-        # --- 5) Inject projector-related parameters ---
-        init_kwargs["W_small"] = W_small
-        init_kwargs["rank"] = rank
-        init_kwargs["projection_type"] = projection_type
+        # inject projector args
+        init_kwargs.update(
+            {
+                "W_small": W_small,
+                "rank": rank,
+                "projection_type": projection_type,
+            }
+        )
 
-        # --- 6) Construct a new layer (matching the original layer family) ---
+        # choose ctor and filter kwargs to its signature
         if isinstance(layer, ColumnParallelLinear):
-            new_layer = ColumnParallelLinearWithProjector(*init_args, **init_kwargs)
+            ctor = ColumnParallelLinearWithProjector
         elif isinstance(layer, RowParallelLinear):
-            new_layer = RowParallelLinearWithProjector(*init_args, **init_kwargs)
+            ctor = RowParallelLinearWithProjector
         else:
             raise TypeError(f"Unsupported layer type: {type(layer)}")
 
-        # --- 7) Copy bias (if it exists and shapes match) ---
+        ctor_kwargs = self._filter_kwargs_for_ctor(ctor, init_kwargs)
+
+        # Ensure required keys are present (your error was exactly these missing)
+        for req in ("input_size", "output_size"):
+            if req not in ctor_kwargs or ctor_kwargs[req] is None:
+                # take from live object as last resort
+                ctor_kwargs[req] = getattr(layer, req)
+
+        # build new layer
+        new_layer = ctor(**ctor_kwargs)
+
+        # copy bias if possible
         try:
             if getattr(layer, "bias", None) is not None and getattr(new_layer, "bias", None) is not None:
                 if layer.bias.shape == new_layer.bias.shape:
@@ -382,10 +442,9 @@ class ModelProjectionUtils:
         except Exception as e:
             print(f"[warn] bias copy skipped: {e}")
 
-        # --- 8) Perform replacement ---
+        # swap
         setattr(parent_module, attr_name, new_layer)
 
-        # --- 9) Print key information ---
         print(
             f"[Projector Replace] {name}: {type(layer).__name__} -> {type(new_layer).__name__} "
             f"(proj={projection_type}, rank={rank}, dtype={params_dtype}, device={device})"

@@ -1,8 +1,11 @@
+from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+
+from typing import Optional, Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 class ColumnParallelLinearWithProjector(ColumnParallelLinear):
     def __init__(

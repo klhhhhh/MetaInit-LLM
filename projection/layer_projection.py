@@ -1,5 +1,5 @@
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear, linear_with_grad_accumulation_and_async_allreduce, linear_with_frozen_weight
 
 from typing import Optional, Callable
 
@@ -162,7 +162,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         # Register small model weights as a buffer
         self.register_buffer("W_small", W_small.to(self.dtype))
 
-        d_out_large, d_in_large = self.output_size_per_partition, input_size
+        d_out_large, d_in_large = output_size, self.input_size_per_partition
         d_out_small, d_in_small = W_small.shape
 
         if projection_type == "symmetric":

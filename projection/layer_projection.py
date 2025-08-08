@@ -160,7 +160,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         self.dtype = config.params_dtype
 
         # Register small model weights as a buffer
-        self.register_buffer("W_small", W_small.to(dtype))
+        self.register_buffer("W_small", W_small.to(self.dtype))
 
         d_out_large, d_in_large = self.output_size_per_partition, input_size
         d_out_small, d_in_small = W_small.shape

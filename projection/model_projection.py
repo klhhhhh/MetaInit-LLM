@@ -127,8 +127,6 @@ class ModelProjectionUtils:
         self.small_model = self._load_small_model(small_model_path)
         self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager, self.dtype = self._load_large_model(large_model_cfg_path)
         self._set_dtype(self.dtype)
-        print("=== Large Model State Dict Keys ===")
-        print(self.large_state_dict.keys())
         self.lora_modules = {}  # name → LoRA projector
 
     def _set_dtype(self, dtype):
@@ -303,81 +301,95 @@ class ModelProjectionUtils:
         rank: int,
         name: str,
     ):
-        # Dependency import
+        # --- Dependencies & types ---
         from nemo_utils.init_hook import INIT_RECORDS
-
         # Retrieve the old layer object
         layer = getattr(parent_module, attr_name)
 
-        # 1) Determine the projection type based on the name
+        # --- 1) Determine projection type ---
         if "linear_qkv" in name:
             projection_type = "qkv"
         elif "linear_proj" in name:
             projection_type = "symmetric"
-        elif "mlp" in name or "fc1" in name or "fc2" in name:
+        elif ("mlp" in name) or ("fc1" in name) or ("fc2" in name):
             projection_type = "asymmetric"
         else:
             raise ValueError(f"Unknown layer for projector replacement: {name}")
 
-        # 2) Retrieve initialization parameters from INIT_RECORDS
-        if layer not in INIT_RECORDS:
-            # Provide a more readable error, suggesting wrapping the constructor with a recorder
+        # --- 2) Read initialization parameters from INIT_RECORDS ---
+        key = id(layer)
+        if key not in INIT_RECORDS:
+            # Debugging information to help locate issues
+            print(f"[replace_layer_with_projector] layer id={key} not in INIT_RECORDS")
+            print(f"[replace_layer_with_projector] known keys sample={list(INIT_RECORDS.keys())[:5]}")
             raise ValueError(
                 f"Cannot find init args for layer {layer} in INIT_RECORDS. "
-                f"Make sure ColumnParallelLinear/RowParallelLinear __init__ is wrapped and recorded."
+                f"Make sure Column/Row __init__ was wrapped & recorded."
             )
 
-        init_args, init_kwargs = INIT_RECORDS[layer]
-        init_kwargs = dict(init_kwargs)  # Avoid modifying the original record
+        # Compatible with the current 4-tuple structure: (cls, qualname, init_args, init_kwargs)
+        rec = INIT_RECORDS[key]
+        if not (isinstance(rec, dict) and len(rec) == 4):
+            raise ValueError(f"INIT_RECORDS[{key}] unexpected format: {type(rec)} / len={len(rec)}")
+        _, _, init_args, init_kwargs = rec
+        if not isinstance(init_args, (tuple, dict)):
+            init_args = tuple(init_args) if init_args is not None else ()
+        init_kwargs = dict(init_kwargs) if isinstance(init_kwargs, dict) else {}
 
-        # 3) Align dtype/device (based on the existing layer's config)
+        # --- 3) Align dtype/device ---
         params_dtype = getattr(layer.config, "params_dtype", target_dtype)
-        device = layer.weight.device if getattr(layer, "weight", None) is not None else torch.cuda.current_device()
+        # Device is prioritized from the weight's device, then inferred from any parameter, and finally defaults to current CUDA device
+        if getattr(layer, "weight", None) is not None:
+            device = layer.weight.device
+        else:
+            try:
+                device = next(layer.parameters()).device
+            except StopIteration:
+                device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
 
         W_small = W_small.to(device=device, dtype=params_dtype)
 
-        # 4) Additional qkv checks (to avoid shape issues later)
+        # --- 4) QKV dimension validation ---
+        # Column: weight shape = (out_per_partition, in). out_per_partition must be divisible by 3
+        # Row:    weight shape = (out, in_per_partition). out must be divisible by 3
         if projection_type == "qkv":
-            # output_size (out_per_partition for column-parallel) and W_small's first dimension must both be divisible by 3
-            out_dim = target_shape[0] if isinstance(layer, ColumnParallelLinear) else target_shape[0]
+            out_dim = target_shape[0]
             if (out_dim % 3) != 0 or (W_small.shape[0] % 3) != 0:
                 raise ValueError(
                     f"QKV projection requires output dim and W_small rows divisible by 3, "
                     f"got out={out_dim}, W_small_rows={W_small.shape[0]}"
                 )
 
-        # 5) Inject projector parameters
+        # --- 5) Inject projector-related parameters ---
         init_kwargs["W_small"] = W_small
         init_kwargs["rank"] = rank
         init_kwargs["projection_type"] = projection_type
 
-        # 6) Construct the new layer
+        # --- 6) Construct a new layer (matching the original layer family) ---
         if isinstance(layer, ColumnParallelLinear):
             new_layer = ColumnParallelLinearWithProjector(*init_args, **init_kwargs)
         elif isinstance(layer, RowParallelLinear):
-            # Ensure the constructor signature and kwargs naming match your implementation
             new_layer = RowParallelLinearWithProjector(*init_args, **init_kwargs)
         else:
             raise TypeError(f"Unsupported layer type: {type(layer)}")
 
-        # 7) Copy the bias values from the old layer (if dimensions match)
-        #    Note: The WithProjector class will recreate the bias param in super().__init__
+        # --- 7) Copy bias (if it exists and shapes match) ---
         try:
             if getattr(layer, "bias", None) is not None and getattr(new_layer, "bias", None) is not None:
                 if layer.bias.shape == new_layer.bias.shape:
                     with torch.no_grad():
                         new_layer.bias.data.copy_(layer.bias.data.to(dtype=params_dtype, device=device))
         except Exception as e:
-            # Non-critical, just print a warning
             print(f"[warn] bias copy skipped: {e}")
 
-        # 8) Finally, replace the old layer with the new one
+        # --- 8) Perform replacement ---
         setattr(parent_module, attr_name, new_layer)
 
-        # 9) Print key information for debugging
-        print(f"[Projector Replace] {name}: {type(layer).__name__} -> {type(new_layer).__name__} "
-            f"(proj={projection_type}, rank={rank}, dtype={params_dtype}, device={device})")
-
+        # --- 9) Print key information ---
+        print(
+            f"[Projector Replace] {name}: {type(layer).__name__} -> {type(new_layer).__name__} "
+            f"(proj={projection_type}, rank={rank}, dtype={params_dtype}, device={device})"
+        )
 
     def free_small_model(self):
         """

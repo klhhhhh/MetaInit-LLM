@@ -135,6 +135,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         skip_bias_add: bool,
         W_small: torch.Tensor,  # [output_size, input_size_small]
         rank: int = 64,
+        projection_type: str = "symmetric",  # ["symmetric", "asymmetric", "qkv"]
         stride: int = 1,
         keep_master_weight_for_test: bool = False,
         is_expert: bool = False,
@@ -154,18 +155,43 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
-        dtype = config.params_dtype
-        d_small_out, d_small_in = W_small.shape
-        d_out_large, d_in_large = self.weight.shape
-
-        # Initialize learnable projection matrices
-        self.A_out = nn.Parameter(torch.randn(d_out_large, rank, dtype=dtype) * 0.01)
-        self.B_out = nn.Parameter(torch.randn(rank, d_small_out, dtype=dtype) * 0.01)
-        self.A_in = nn.Parameter(torch.randn(d_in_large, rank, dtype=dtype) * 0.01)
-        self.B_in = nn.Parameter(torch.randn(rank, d_small_in, dtype=dtype) * 0.01)
+        self.projector_enabled = True
+        self.projection_type = projection_type
+        self.dtype = config.params_dtype
 
         # Register small model weights as a buffer
         self.register_buffer("W_small", W_small.to(dtype))
+
+        d_out_large, d_in_large = self.output_size_per_partition, input_size
+        d_out_small, d_in_small = W_small.shape
+
+        if projection_type == "symmetric":
+            self.A = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
+            self.B = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
+
+        elif projection_type == "asymmetric":
+            self.A_out = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
+            self.B_out = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
+            self.A_in  = nn.Parameter(torch.randn(d_in_large, rank, dtype=self.dtype) * 0.01)
+            self.B_in  = nn.Parameter(torch.randn(rank, d_in_small, dtype=self.dtype) * 0.01)
+        
+        else:
+            raise ValueError(f"Unsupported projection_type: {projection_type}")
+
+    def get_projected_weight(self):
+        W_s = self.W_small.to(self.dtype)
+
+        if self.projection_type == "symmetric":
+            P = self.A @ self.B
+            return P @ W_s @ P.T
+
+        elif self.projection_type == "asymmetric":
+            P_out = self.A_out @ self.B_out
+            P_in  = self.A_in @ self.B_in
+            return P_out @ W_s @ P_in.T
+
+        else:
+            raise NotImplementedError
 
     def forward(self, input_):
         if self.config._cpu_offloading_context is not None:
@@ -182,9 +208,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
 
         # Construct projected weights
         with torch.autocast(device_type='cuda', dtype=self.config.params_dtype):
-            P_out = self.A_out @ self.B_out
-            P_in = self.A_in @ self.B_in
-            W_proj = P_out @ self.W_small @ P_in.transpose(-1, -2)
+            W_proj = self.get_projected_weight()
 
         # Compute output
         if not self.weight.requires_grad:

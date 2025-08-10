@@ -1,5 +1,3 @@
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-
 INIT_RECORDS = {}
 
 def patch_layer(cls, cls_name):

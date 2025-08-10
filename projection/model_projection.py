@@ -178,19 +178,6 @@ class ModelProjectionUtils:
         W_large = self.normalize_projection(W_large, target_param)
         return W_large
 
-    # def replace_with_projected_linear(self, parent_module, attr_name, W_small, target_shape, target_dtype, rank, name):
-    #     if "linear_qkv" in name:
-    #         projector = QKVProjectedLinear(W_small, dtype=target_dtype , d_large=target_shape[1], rank=rank)
-    #     elif "linear_proj" in name:
-    #         projector = SymmetricProjectedLinear(W_small, dtype=target_dtype, d_large=target_shape[1], rank=rank)
-    #     elif "mlp" in name:
-    #         projector = AsymmetricProjectedLinear(W_small, dtype=target_dtype, d_out_large=target_shape[0], d_in_large=target_shape[1], rank=rank)
-    #     else:
-    #         raise ValueError(f"Unknown layer for projector replacement: {name}")
-
-    #     print("Type of Replaced Module:", type(getattr(parent_module, attr_name))) 
-    #     setattr(parent_module, attr_name, projector) 
-    #     print(f"[Learnable] Replaced {attr_name} in {name} with {projector.__class__.__name__}")
     def _bind_init_kwargs_from_record(self, layer, rec: dict) -> dict:
         """
         Build a kwargs dict for re-instantiation from INIT_RECORDS entry:
@@ -423,6 +410,12 @@ class ModelProjectionUtils:
                                 align_corners=True
                             ).squeeze()
                             param_large.data.copy_(interpolated)
+
+            if learnable:
+                print("✅ Layer parameters projected successfully.")
+                print("parameters in large model after layer projection:")
+                for name, param in self.large_model.named_parameters():
+                    print(f"{name}: {param.shape}")
 
         # Step 3: Handle direct mapping of non-layer parameters (e.g., embedding and final layer norm)
         for name, param_small in small_state_dict.items():

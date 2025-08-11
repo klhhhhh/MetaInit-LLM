@@ -8,7 +8,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype):
+    A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
+    B = nn.Parameter(torch.empty(rank, in_dim_small, device=device, dtype=dtype))
+    # 简化的方差守恒：std ≈ 1/sqrt(fan)
+    torch.nn.init.normal_(A, mean=0.0, std=1.0 / (in_dim_small ** 0.5))
+    torch.nn.init.normal_(B, mean=0.0, std=1.0 / (rank ** 0.5))
+    return A, B
+
+
+# ===============================================
+#  ColumnParallelLinear + Learnable Projector (α)
+# ===============================================
 class ColumnParallelLinearWithProjector(ColumnParallelLinear):
+    """
+    Extends ColumnParallelLinear with:
+      - Learnable low-rank projection (symmetric / asymmetric / qkv)
+      - Lazy initialization with one-time norm matching (proj_scale)
+      - Learnable alpha (residual: W_eff = W_base + alpha * W_proj_scaled)
+    """
+
     def __init__(
         self,
         input_size,
@@ -49,81 +68,164 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             disable_grad_reduce=disable_grad_reduce,
         )
 
-        self.projector_enabled = True
+        assert projection_type in ("symmetric", "asymmetric", "qkv")
         self.projection_type = projection_type
-        self.dtype = config.params_dtype
 
-        self.register_buffer('W_small', W_small.clone().detach().to(self.dtype))
+        # Match device and dtype with the original layer
+        device = self.weight.device
+        dtype = self.config.params_dtype
 
-        d_out_large, d_in_large = self.output_size_per_partition, input_size
-        d_out_small, d_in_small = W_small.shape
+        # Store the small model weight
+        self.register_buffer("W_small", W_small.clone().detach().to(device=device, dtype=dtype), persistent=False)
 
+        # Number of rows in the large weight for this partition (row-parallel: rows split across TP)
+        d_out_large = self.output_size_per_partition
+        d_in_large = self.input_size
+        d_out_small, d_in_small = self.W_small.shape
+
+        # Low-rank projection parameters
         if projection_type == "symmetric":
-            self.A = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
-            self.B = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
+            # Only valid for square matrices (e.g., hidden -> hidden)
+            self.A_out, self.B_out = _init_AB_pair(d_out_large, d_out_small, rank, device, dtype)
+            # Symmetric in-side: reuse P for both in and out
+            self.A_in = None
+            self.B_in = None
 
         elif projection_type == "asymmetric":
-            self.A_out = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
-            self.B_out = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
-            self.A_in  = nn.Parameter(torch.randn(d_in_large, rank, dtype=self.dtype) * 0.01)
-            self.B_in  = nn.Parameter(torch.randn(rank, d_in_small, dtype=self.dtype) * 0.01)
+            # Separate low-rank projections for out and in sides
+            self.A_out, self.B_out = _init_AB_pair(d_out_large, d_out_small, rank, device, dtype)
+            self.A_in,  self.B_in  = _init_AB_pair(d_in_large,  d_in_small,  rank, device, dtype)
 
-        elif projection_type == "qkv":
-            # Assume each q/k/v small matrix is square
-            d_total_small = W_small.shape[0]
-            assert d_total_small % 3 == 0, "QKV projection requires W_small divisible by 3"
-            d_single_small = d_total_small // 3
-            d_single_large = d_out_large // 3
+        else:  # "qkv"
+            # Separate projections for Q/K/V on the out side (symmetric), reuse P_in for in side
+            # Simplified: qkv uses symmetric method (each segment is square)
+            self.A_out, self.B_out = _init_AB_pair(d_out_large // 3, d_out_small // 3, rank, device, dtype)
+            self.A_in = None
+            self.B_in = None
 
-            self.q_proj = self._init_symmetric_proj(rank, d_single_large, d_single_small)
-            self.k_proj = self._init_symmetric_proj(rank, d_single_large, d_single_small)
-            self.v_proj = self._init_symmetric_proj(rank, d_single_large, d_single_small)
+        # Learnable alpha (residual weight), initialized small for stable training
+        self.alpha = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
 
-        else:
-            raise ValueError(f"Unsupported projection_type: {projection_type}")
+        # Lazy initialization state & proj_scale (one-time norm matching)
+        self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
 
-    def _init_symmetric_proj(self, rank, d_large, d_small):
-        return nn.ParameterDict({
-            'A': nn.Parameter(torch.randn(d_large, rank, dtype=self.dtype) * 0.01),
-            'B': nn.Parameter(torch.randn(rank, d_small, dtype=self.dtype) * 0.01),
-        })
-
-    def get_projected_weight(self):
-        W_s = self.W_small.to(self.dtype)
+    # --- Internal: Compute projected weight based on type ---
+    def _project_weight_once(self, input_dtype: torch.dtype) -> torch.Tensor:
+        W_s = self.W_small.to(dtype=input_dtype)
 
         if self.projection_type == "symmetric":
-            P = self.A @ self.B
-            return P @ W_s @ P.T
+            # P_out = A_out @ B_out  --> [d_out_large, d_out_small]
+            P = (self.A_out @ self.B_out).to(dtype=input_dtype)
+            # Symmetric: W_proj = P @ W_s @ P^T  --> [d_out_large, d_out_large]
+            W_proj = P @ W_s @ P.transpose(-1, -2)
+
+            # Ensure square mapping per partition: d_in_large == d_out_large
+            if W_proj.shape != (self.output_size_per_partition, self.output_size_per_partition):
+                raise RuntimeError(
+                    f"[symmetric] requires square mapping per partition. "
+                    f"got W_proj={tuple(W_proj.shape)}, expected=({self.output_size_per_partition}, "
+                    f"{self.output_size_per_partition})"
+                )
+            # Ensure input_size matches output_size_per_partition (hidden)
+            if self.input_size != self.output_size_per_partition:
+                raise RuntimeError(
+                    f"[symmetric] expects input_size == output_size_per_partition; "
+                    f"got {self.input_size} vs {self.output_size_per_partition}"
+                )
+
+            # Target shape should be [out_per_partition, input_size]
+            return W_proj  # Dimensions match, satisfies [out, in]
 
         elif self.projection_type == "asymmetric":
-            P_out = self.A_out @ self.B_out
-            P_in  = self.A_in @ self.B_in
-            return P_out @ W_s @ P_in.T
+            # P_out: [d_out_large, d_out_small]
+            P_out = (self.A_out @ self.B_out).to(dtype=input_dtype)
+            # P_in : [d_in_large, d_in_small]
+            P_in  = (self.A_in  @ self.B_in ).to(dtype=input_dtype)
+            # W_proj: [d_out_large, d_in_large]
+            return P_out @ W_s @ P_in.transpose(-1, -2)
 
-        elif self.projection_type == "qkv":
-            W_q, W_k, W_v = torch.chunk(W_s, 3, dim=0)
+        else:  # "qkv"
+            # Split rows of the small model weight
+            if (W_s.shape[0] % 3 != 0) or (self.output_size_per_partition % 3 != 0):
+                raise RuntimeError(
+                    f"[qkv] requires rows divisible by 3: W_small_rows={W_s.shape[0]}, "
+                    f"out_per_partition={self.output_size_per_partition}"
+                )
+            d_out_s_per = W_s.shape[0] // 3
+            d_out_l_per = self.output_size_per_partition // 3
+            chunks_s = torch.chunk(W_s, 3, dim=0)
 
-            def project(W, proj):
-                P = proj['A'] @ proj['B']
-                return P @ W @ P.T
+            # Symmetric: each segment uses the same (A_out, B_out) to generate P, then P @ W_s_i @ P^T
+            P = (self.A_out @ self.B_out).to(dtype=input_dtype)  # [d_out_l_per, d_out_s_per]
+            outs = []
+            for i in range(3):
+                W_i = chunks_s[i]
+                W_i_proj = P @ W_i @ P.transpose(-1, -2)  # [d_out_l_per, d_out_l_per]
+                # Same as symmetric, ensure square and in==out==hidden_per_partition
+                if W_i_proj.shape != (d_out_l_per, d_out_l_per) or d_out_l_per != (self.input_size // 3):
+                    # Raise error for slight mismatches to avoid silent shape errors
+                    raise RuntimeError(
+                        f"[qkv] per-chunk should be square and match in-dim per chunk. "
+                        f"W_i_proj={tuple(W_i_proj.shape)}, out_per={d_out_l_per}, in_per={self.input_size//3}"
+                    )
+                outs.append(W_i_proj)
 
-            W_q_proj = project(W_q, self.q_proj)
-            W_k_proj = project(W_k, self.k_proj)
-            W_v_proj = project(W_v, self.v_proj)
+            return torch.cat(outs, dim=0)  # [out_per_partition, input_size]
 
-            return torch.cat([W_q_proj, W_k_proj, W_v_proj], dim=0)
+    # --- Lazy initialization: one-time norm matching ---
+    def _lazy_norm_init(self, input_dtype: torch.dtype):
+        if int(self._proj_inited.item()) == 1:
+            return
+        with torch.no_grad():
+            W_proj = self._project_weight_once(input_dtype)
+            W_base = self.weight.to(dtype=input_dtype)
 
-        else:
-            raise NotImplementedError
+            eps = 1e-12
+            norm_proj = torch.linalg.norm(W_proj, ord='fro')
+            norm_base = torch.linalg.norm(W_base, ord='fro')
+            scale = (norm_base / (norm_proj + eps)).detach()
 
+            self.proj_scale.data = scale.to(dtype=self.proj_scale.dtype, device=self.proj_scale.device)
+            # Keep alpha initialized to a small value (already set to 1e-3 in __init__)
+            self._proj_inited.data.fill_(1)
+
+    # --- Used in forward: Get the effective weight ---
+    def _effective_weight(self, input_dtype: torch.dtype) -> torch.Tensor:
+        # 1) Lazy initialization (one-time norm matching)
+        self._lazy_norm_init(input_dtype)
+
+        # 2) Generate W_proj and scale it
+        W_proj = self._project_weight_once(input_dtype)
+        W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
+
+        # 3) Residual fusion: W_eff = W_base + alpha * W_proj
+        W_base = self.weight.to(dtype=input_dtype)
+        alpha  = self.alpha.to(dtype=input_dtype)
+        return W_base + alpha * W_proj
+
+    # --- Override forward, inject weight, reuse parent logic ---
     def forward(self, input_, weight=None, runtime_gather_output=None):
+        # Ignore the passed weight, use our W_eff
+        weight_override = self._effective_weight(input_.dtype)
+        return super().forward(input_, weight=weight_override, runtime_gather_output=runtime_gather_output)
 
-        if self.projector_enabled:
-            weight = self.get_projected_weight()
 
-        return super().forward(input_, weight=weight, runtime_gather_output=runtime_gather_output)
-
+# =============================================
+#  RowParallelLinear + Learnable Projector (α)
+# =============================================
 class RowParallelLinearWithProjector(RowParallelLinear):
+    """
+    Extends RowParallelLinear with:
+      - Learnable low-rank projection (symmetric / asymmetric)
+      - Lazy initialization with one-time norm matching (proj_scale)
+      - Learnable alpha (residual: W_eff = W_base + alpha * W_proj_scaled)
+    Notes:
+      - The forward method of Row does not have a weight parameter. 
+        Therefore, the original forward is strictly replicated here, 
+        with only the weight used in matmul replaced by our W_eff.
+    """
+
     def __init__(
         self,
         input_size: int,
@@ -156,44 +258,73 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
-        self.projector_enabled = True
+        assert projection_type in ("symmetric", "asymmetric")
         self.projection_type = projection_type
-        self.dtype = config.params_dtype
 
-        # Register small model weights as a buffer
-        self.register_buffer("W_small", W_small.to(self.dtype))
+        device = self.weight.device
+        dtype  = self.config.params_dtype
 
-        d_out_large, d_in_large = output_size, self.input_size_per_partition
-        d_out_small, d_in_small = W_small.shape
+        self.register_buffer("W_small", W_small.clone().detach().to(device=device, dtype=dtype), persistent=False)
+
+        d_out_large = self.output_size
+        d_in_large  = self.input_size_per_partition  # Note: Row partitions along the column dimension
+        d_out_small, d_in_small = self.W_small.shape
 
         if projection_type == "symmetric":
-            self.A = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
-            self.B = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
-
-        elif projection_type == "asymmetric":
-            self.A_out = nn.Parameter(torch.randn(d_out_large, rank, dtype=self.dtype) * 0.01)
-            self.B_out = nn.Parameter(torch.randn(rank, d_out_small, dtype=self.dtype) * 0.01)
-            self.A_in  = nn.Parameter(torch.randn(d_in_large, rank, dtype=self.dtype) * 0.01)
-            self.B_in  = nn.Parameter(torch.randn(rank, d_in_small, dtype=self.dtype) * 0.01)
-        
+            # Only valid for square matrices (e.g., hidden -> hidden)
+            self.A_out, self.B_out = _init_AB_pair(d_out_large, d_out_small, rank, device, dtype)
+            self.A_in = None
+            self.B_in = None
         else:
-            raise ValueError(f"Unsupported projection_type: {projection_type}")
+            self.A_out, self.B_out = _init_AB_pair(d_out_large, d_out_small, rank, device, dtype)
+            # Row weight shape = [out, in_per_partition], we need to project the in side to in_per_partition
+            self.A_in,  self.B_in  = _init_AB_pair(d_in_large,  d_in_small,  rank, device, dtype)
 
-    def get_projected_weight(self):
-        W_s = self.W_small.to(self.dtype)
+        self.alpha = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+        self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
 
+    def _project_weight_once(self, input_dtype: torch.dtype) -> torch.Tensor:
+        W_s = self.W_small.to(dtype=input_dtype)
         if self.projection_type == "symmetric":
-            P = self.A @ self.B
-            return P @ W_s @ P.T
+            P = (self.A_out @ self.B_out).to(dtype=input_dtype)         # [d_out_large, d_out_small]
+            W_proj_full = P @ W_s @ P.transpose(-1, -2)                 # [d_out_large, d_out_large]
+            if W_proj_full.shape[1] != self.input_size_per_partition:
+                raise RuntimeError(
+                    f"[Row symmetric] expects in-per-partition == out; "
+                    f"got in_per={self.input_size_per_partition}, out={self.output_size}"
+                )
+            # Slice/map to the current partition's columns (assuming no TP column splitting; adjust if needed)
+            return W_proj_full[:, : self.input_size_per_partition]
 
-        elif self.projection_type == "asymmetric":
-            P_out = self.A_out @ self.B_out
-            P_in  = self.A_in @ self.B_in
-            return P_out @ W_s @ P_in.T
+        else:  # asymmetric
+            P_out = (self.A_out @ self.B_out).to(dtype=input_dtype)     # [d_out_large, d_out_small]
+            P_in  = (self.A_in  @ self.B_in ).to(dtype=input_dtype)     # [d_in_large,  d_in_small]
+            W_proj = P_out @ W_s @ P_in.transpose(-1, -2)               # [d_out_large, d_in_large]
+            return W_proj  # Its column dimension already equals in_per_partition
 
-        else:
-            raise NotImplementedError
+    def _lazy_norm_init(self, input_dtype: torch.dtype):
+        if int(self._proj_inited.item()) == 1:
+            return
+        with torch.no_grad():
+            W_proj = self._project_weight_once(input_dtype)
+            W_base = self.weight.to(dtype=input_dtype)
+            eps = 1e-12
+            norm_proj = torch.linalg.norm(W_proj, ord='fro')
+            norm_base = torch.linalg.norm(W_base, ord='fro')
+            scale = (norm_base / (norm_proj + eps)).detach()
+            self.proj_scale.data = scale.to(dtype=self.proj_scale.dtype, device=self.proj_scale.device)
+            self._proj_inited.data.fill_(1)
 
+    def _effective_weight(self, input_dtype: torch.dtype) -> torch.Tensor:
+        self._lazy_norm_init(input_dtype)
+        W_proj = self._project_weight_once(input_dtype)
+        W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
+        W_base = self.weight.to(dtype=input_dtype)
+        alpha  = self.alpha.to(dtype=input_dtype)
+        return W_base + alpha * W_proj
+
+    # Strictly replicate the original Row forward, replacing the final weight used in matmul with our W_eff
     def forward(self, input_):
         if self.config._cpu_offloading_context is not None:
             if self.config._cpu_offloading_context.inside_context is True:
@@ -207,11 +338,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
 
-        # Construct projected weights
-        with torch.autocast(device_type='cuda', dtype=self.config.params_dtype):
-            W_proj = self.get_projected_weight()
-
-        # Compute output
+        # Determine _forward_impl
         if not self.weight.requires_grad:
             self._forward_impl = linear_with_frozen_weight
         else:
@@ -219,9 +346,12 @@ class RowParallelLinearWithProjector(RowParallelLinear):
 
         allreduce_dgrad = False
 
+        # === Inject our weight ===
+        weight_override = self._effective_weight(input_parallel.dtype)
+
         output_parallel = self._forward_impl(
             input=input_parallel,
-            weight=W_proj,
+            weight=weight_override,   # <-- Use our constructed W_eff
             bias=None,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             async_grad_allreduce=allreduce_dgrad,

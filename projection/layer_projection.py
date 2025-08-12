@@ -11,7 +11,7 @@ import torch.nn.functional as F
 def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype):
     A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
     B = nn.Parameter(torch.empty(rank, in_dim_small, device=device, dtype=dtype))
-    # 简化的方差守恒：std ≈ 1/sqrt(fan)
+    # Simplified variance preservation: std ≈ 1/sqrt(fan)
     torch.nn.init.normal_(A, mean=0.0, std=1.0 / (in_dim_small ** 0.5))
     torch.nn.init.normal_(B, mean=0.0, std=1.0 / (rank ** 0.5))
     return A, B
@@ -112,11 +112,12 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
     # --- Internal: Compute projected weight based on type ---
     def _project_weight_once(self, input_dtype: torch.dtype) -> torch.Tensor:
-        W_s = self.W_small.to(dtype=input_dtype)
+        dev = self.weight.device
+        W_s = self.W_small.to(device=dev, dtype=input_dtype)
 
         if self.projection_type == "symmetric":
             # P_out = A_out @ B_out  --> [d_out_large, d_out_small]
-            P = (self.A_out @ self.B_out).to(dtype=input_dtype)
+            P = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)
             # Symmetric: W_proj = P @ W_s @ P^T  --> [d_out_large, d_out_large]
             W_proj = P @ W_s @ P.transpose(-1, -2)
 
@@ -139,11 +140,10 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
         elif self.projection_type == "asymmetric":
             # P_out: [d_out_large, d_out_small]
-            P_out = (self.A_out @ self.B_out).to(dtype=input_dtype)
+            P_out = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)
             # P_in : [d_in_large, d_in_small]
-            P_in  = (self.A_in  @ self.B_in ).to(dtype=input_dtype)
-            # W_proj: [d_out_large, d_in_large]
-            return P_out @ W_s @ P_in.transpose(-1, -2)
+            P_in  = (self.A_in.to(dev)  @ self.B_in.to(dev) ).to(dtype=input_dtype)
+            return P_out @ W_s @ P_in.transpose(-1, -2)  # [d_out_large, d_in_large] = [out_per_partition, input_size]
 
         else:  # "qkv"
             # Split rows of the small model weight
@@ -154,24 +154,39 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
                 )
             d_out_s_per = W_s.shape[0] // 3
             d_out_l_per = self.output_size_per_partition // 3
+            in_dim      = self.input_size
             chunks_s = torch.chunk(W_s, 3, dim=0)
 
-            # Symmetric: each segment uses the same (A_out, B_out) to generate P, then P @ W_s_i @ P^T
-            P = (self.A_out @ self.B_out).to(dtype=input_dtype)  # [d_out_l_per, d_out_s_per]
+            # 情况 A：每块为方阵（典型 tp=1）：d_out_l_per == in_dim
+            if d_out_l_per == in_dim:
+                # 走对称投影：为三块共用一个 P（或你也可改为各自独立的 P_q/P_k/P_v）
+                P = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)  # [d_out_l_per, d_out_s_per]
+                outs = []
+                for i in range(3):
+                    W_i = chunks_s[i]  # [d_s, d_s]
+                    W_i_proj = P @ W_i @ P.transpose(-1, -2)  # [d_out_l_per, d_out_l_per]
+                    # 拼回 fused 形状：[3*d_out_l_per, d_out_l_per] = [out_per_partition, input_size]（此时 in_dim==d_out_l_per）
+                    outs.append(W_i_proj)
+                return torch.cat(outs, dim=0)
+
+            # 情况 B：常规列并行（tp>1）：每块不是方阵 -> 非对称投影
+            # 需要 P_in: [in_dim, d_s]，P_out: [d_out_l_per, d_s]
+            if not hasattr(self, "A_in") or not hasattr(self, "B_in"):
+                raise RuntimeError(
+                    "[qkv] non-square per-chunk requires A_in/B_in (for P_in). "
+                    "Please initialize projector with asymmetric-in support."
+                )
+
+            P_in  = (self.A_in.to(dev)  @ self.B_in.to(dev) ).to(dtype=input_dtype)    # [in_dim, d_s]
+            P_out = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)    # [d_out_l_per, d_s]
+
             outs = []
             for i in range(3):
-                W_i = chunks_s[i]
-                W_i_proj = P @ W_i @ P.transpose(-1, -2)  # [d_out_l_per, d_out_l_per]
-                # Same as symmetric, ensure square and in==out==hidden_per_partition
-                if W_i_proj.shape != (d_out_l_per, d_out_l_per) or d_out_l_per != (self.input_size // 3):
-                    # Raise error for slight mismatches to avoid silent shape errors
-                    raise RuntimeError(
-                        f"[qkv] per-chunk should be square and match in-dim per chunk. "
-                        f"W_i_proj={tuple(W_i_proj.shape)}, out_per={d_out_l_per}, in_per={self.input_size//3}"
-                    )
+                W_i = chunks_s[i]                           # [d_s, d_s]
+                W_i_proj = P_out @ W_i @ P_in.transpose(-1, -2)  # [d_out_l_per, in_dim]
                 outs.append(W_i_proj)
+            return torch.cat(outs, dim=0)  # [out_per_partition, in_dim]
 
-            return torch.cat(outs, dim=0)  # [out_per_partition, input_size]
 
     # --- Lazy initialization: one-time norm matching ---
     def _lazy_norm_init(self, input_dtype: torch.dtype):

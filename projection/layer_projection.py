@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ------------------------------------------------
-# Small-variance low-rank init; 保持与原代码风格一致
+# Small-variance low-rank initialization; consistent with the original code style
 # ------------------------------------------------
 def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype):
     A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
@@ -100,11 +100,16 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             self.A_in,  self.B_in  = _init_AB_pair(d_in_large,  d_in_small,  rank, device, dtype)
 
         else:  # "qkv"
-            # Separate projections for Q/K/V on the out side (symmetric), reuse P_in for in side
-            # Simplified: qkv uses symmetric method (each segment is square)
-            self.A_out, self.B_out = _init_AB_pair(d_out_large // 3, d_out_small // 3, rank, device, dtype)
-            # 若需要支持 tp>1 下 qkv 非方阵块映射，可在外部选择 asymmetric/qkv+in，并传入 A_in/B_in
-            self.A_in, self.B_in = None, None
+            d_out_l_per = d_out_large // 3
+            d_out_s_per = d_out_small // 3
+
+            self.A_out_q, self.B_out_q = _init_AB_pair(d_out_l_per, d_out_s_per, rank, device, dtype)
+            self.A_out_k, self.B_out_k = _init_AB_pair(d_out_l_per, d_out_s_per, rank, device, dtype)
+            self.A_out_v, self.B_out_v = _init_AB_pair(d_out_l_per, d_out_s_per, rank, device, dtype)
+
+            # If support for non-square block mapping of qkv under tp>1 is needed, 
+            # a single in-side projection is still used here (can be split into three sets for q/k/v if required).
+            self.A_in, self.B_in = None, None  # For non-square support, please use the asymmetric-in version during initialization.
 
         # ---- α in [0,1]：用 logit 参数化，便于 schedule/约束 ----
         # 初始 α≈1e-3 => logit(α) ≈ log(α/(1-α))
@@ -165,39 +170,36 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             d_out_s_per = W_s.shape[0] // 3
             d_out_l_per = self.output_size_per_partition // 3
             in_dim      = self.input_size
-            chunks_s = torch.chunk(W_s, 3, dim=0)
 
-            # Case A: Each block is square (typical for tp=1): d_out_l_per == in_dim
+            W_q, W_k, W_v = torch.chunk(W_s, 3, dim=0)
+
+            # Generate respective P_q / P_k / P_v
+            P_q = (self.A_out_q.to(dev) @ self.B_out_q.to(dev)).to(dtype=input_dtype)  # [d_out_l_per, d_out_s_per]
+            P_k = (self.A_out_k.to(dev) @ self.B_out_k.to(dev)).to(dtype=input_dtype)
+            P_v = (self.A_out_v.to(dev) @ self.B_out_v.to(dev)).to(dtype=input_dtype)
+
+            # Case A: Each block is a square matrix (typical tp=1): d_out_l_per == in_dim
             if d_out_l_per == in_dim:
-                # Use symmetric projection: a single P is shared across the three blocks 
-                # (or you could modify it to use independent P_q/P_k/P_v for each block)
-                P = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)  # [d_out_l_per, d_out_s_per]
-                outs = []
-                for i in range(3):
-                    W_i = chunks_s[i]  # [d_s, d_s]
-                    W_i_proj = P @ W_i @ P.transpose(-1, -2)  # [d_out_l_per, d_out_l_per]
-                    # Concatenate back to the fused shape: [3*d_out_l_per, d_out_l_per] = [out_per_partition, input_size] 
-                    # (at this point, in_dim == d_out_l_per)
-                    outs.append(W_i_proj)
-                return torch.cat(outs, dim=0)
+                W_q_proj = P_q @ W_q @ P_q.transpose(-1, -2)  # [d_out_l_per, d_out_l_per]
+                W_k_proj = P_k @ W_k @ P_k.transpose(-1, -2)
+                W_v_proj = P_v @ W_v @ P_v.transpose(-1, -2)
+                return torch.cat([W_q_proj, W_k_proj, W_v_proj], dim=0)  # [out_per_partition, in_dim]
 
-            # Case B: Column parallelism (tp > 1): requires in-side projection
+            # Case B: Column-parallel (tp>1): requires in-side projection
             if self.A_in is None or self.B_in is None:
                 raise RuntimeError(
+                    "Not implemented for tp>1 with qkv projection. "
                     "[qkv] non-square per-chunk requires A_in/B_in (for P_in). "
                     "Please initialize projector with asymmetric-in support."
                 )
 
-            P_in  = (self.A_in.to(dev)  @ self.B_in.to(dev) ).to(dtype=input_dtype)    # [in_dim, d_s]
-            P_out = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)    # [d_out_l_per, d_s]
+            P_in = (self.A_in.to(dev) @ self.B_in.to(dev)).to(dtype=input_dtype)  # [in_dim, d_out_s_per]
+            # If in-side q/k/v projections need to differ, split into P_in_q/k/v sets of parameters and use them here.
 
-            outs = []
-            for i in range(3):
-                W_i = chunks_s[i]                           # [d_s, d_s]
-                W_i_proj = P_out @ W_i @ P_in.transpose(-1, -2)  # [d_out_l_per, in_dim]
-                outs.append(W_i_proj)
-            return torch.cat(outs, dim=0)  # [out_per_partition, in_dim]
-
+            W_q_proj = P_q @ W_q @ P_in.transpose(-1, -2)  # [d_out_l_per, in_dim]
+            W_k_proj = P_k @ W_k @ P_in.transpose(-1, -2)
+            W_v_proj = P_v @ W_v @ P_in.transpose(-1, -2)
+            return torch.cat([W_q_proj, W_k_proj, W_v_proj], dim=0)
 
     # --- Lazy initialization: one-time norm matching ---
     def _lazy_norm_init(self, input_dtype: torch.dtype):

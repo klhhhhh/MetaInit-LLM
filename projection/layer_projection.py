@@ -8,12 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ------------------------------------------------
+# Small-variance low-rank init; 保持与原代码风格一致
+# ------------------------------------------------
 def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype):
     A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
     B = nn.Parameter(torch.empty(rank, in_dim_small, device=device, dtype=dtype))
-    # Simplified variance preservation: std ≈ 1/sqrt(fan)
-    torch.nn.init.normal_(A, mean=0.0, std=1.0 / (in_dim_small ** 0.5))
-    torch.nn.init.normal_(B, mean=0.0, std=1.0 / (rank ** 0.5))
+    # Small-variance Gaussian initialization to avoid overly strong projections. Scaled in a fan-in style.
+    torch.nn.init.normal_(A, mean=0.0, std=(1.0 / max(1, in_dim_small) ** 0.5))
+    torch.nn.init.normal_(B, mean=0.0, std=(1.0 / max(1, rank) ** 0.5))
     return A, B
 
 
@@ -100,17 +103,24 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             # Separate projections for Q/K/V on the out side (symmetric), reuse P_in for in side
             # Simplified: qkv uses symmetric method (each segment is square)
             self.A_out, self.B_out = _init_AB_pair(d_out_large // 3, d_out_small // 3, rank, device, dtype)
-            self.A_in = None
-            self.B_in = None
+            # 若需要支持 tp>1 下 qkv 非方阵块映射，可在外部选择 asymmetric/qkv+in，并传入 A_in/B_in
+            self.A_in, self.B_in = None, None
 
-        # Learnable alpha (residual weight), initialized small for stable training
-        self.alpha = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+        # ---- α in [0,1]：用 logit 参数化，便于 schedule/约束 ----
+        # 初始 α≈1e-3 => logit(α) ≈ log(α/(1-α))
+        alpha0 = 1e-3
+        alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
+        self.alpha_logit = nn.Parameter(alpha_logit_init)
 
         # Lazy initialization state & proj_scale (one-time norm matching)
         self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
 
-    # --- Internal: Compute projected weight based on type ---
+    # --- α retrieval (sigmoid constrained to [0,1]) ---
+    def _alpha(self, dtype):
+        return torch.sigmoid(self.alpha_logit).to(dtype=dtype)
+
+    # --- Generate projection weight once ---
     def _project_weight_once(self, input_dtype: torch.dtype) -> torch.Tensor:
         dev = self.weight.device
         W_s = self.W_small.to(device=dev, dtype=input_dtype)
@@ -157,21 +167,22 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             in_dim      = self.input_size
             chunks_s = torch.chunk(W_s, 3, dim=0)
 
-            # 情况 A：每块为方阵（典型 tp=1）：d_out_l_per == in_dim
+            # Case A: Each block is square (typical for tp=1): d_out_l_per == in_dim
             if d_out_l_per == in_dim:
-                # 走对称投影：为三块共用一个 P（或你也可改为各自独立的 P_q/P_k/P_v）
+                # Use symmetric projection: a single P is shared across the three blocks 
+                # (or you could modify it to use independent P_q/P_k/P_v for each block)
                 P = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)  # [d_out_l_per, d_out_s_per]
                 outs = []
                 for i in range(3):
                     W_i = chunks_s[i]  # [d_s, d_s]
                     W_i_proj = P @ W_i @ P.transpose(-1, -2)  # [d_out_l_per, d_out_l_per]
-                    # 拼回 fused 形状：[3*d_out_l_per, d_out_l_per] = [out_per_partition, input_size]（此时 in_dim==d_out_l_per）
+                    # Concatenate back to the fused shape: [3*d_out_l_per, d_out_l_per] = [out_per_partition, input_size] 
+                    # (at this point, in_dim == d_out_l_per)
                     outs.append(W_i_proj)
                 return torch.cat(outs, dim=0)
 
-            # 情况 B：常规列并行（tp>1）：每块不是方阵 -> 非对称投影
-            # 需要 P_in: [in_dim, d_s]，P_out: [d_out_l_per, d_s]
-            if not hasattr(self, "A_in") or not hasattr(self, "B_in"):
+            # Case B: Column parallelism (tp > 1): requires in-side projection
+            if self.A_in is None or self.B_in is None:
                 raise RuntimeError(
                     "[qkv] non-square per-chunk requires A_in/B_in (for P_in). "
                     "Please initialize projector with asymmetric-in support."
@@ -216,8 +227,9 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
         # 3) Residual fusion: W_eff = W_base + alpha * W_proj
         W_base = self.weight.to(dtype=input_dtype)
-        alpha  = self.alpha.to(dtype=input_dtype)
-        return W_base + alpha * W_proj
+        alpha  = self._alpha(dtype=input_dtype)
+
+        return (1.0 - alpha) * W_base + alpha * W_proj
 
     # --- Override forward, inject weight, reuse parent logic ---
     def forward(self, input_, weight=None, runtime_gather_output=None):
@@ -253,7 +265,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         skip_bias_add: bool,
         W_small: torch.Tensor,  # [output_size, input_size_small]
         rank: int = 64,
-        projection_type: str = "symmetric",  # ["symmetric", "asymmetric", "qkv"]
+        projection_type: str = "symmetric",  # ["symmetric", "asymmetric"]
         stride: int = 1,
         keep_master_weight_for_test: bool = False,
         is_expert: bool = False,
@@ -295,16 +307,24 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             # Row weight shape = [out, in_per_partition], we need to project the in side to in_per_partition
             self.A_in,  self.B_in  = _init_AB_pair(d_in_large,  d_in_small,  rank, device, dtype)
 
-        self.alpha = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+        # α in [0,1]
+        alpha0 = 1e-3
+        alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
+        self.alpha_logit = nn.Parameter(alpha_logit_init)
+
         self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
 
+    def _alpha(self, dtype):
+        return torch.sigmoid(self.alpha_logit).to(dtype=dtype)
+
     def _project_weight_once(self, input_dtype: torch.dtype) -> torch.Tensor:
-        W_s = self.W_small.to(dtype=input_dtype)
+        dev = self.weight.device
+        W_s = self.W_small.to(device=dev, dtype=input_dtype)
         if self.projection_type == "symmetric":
-            P = (self.A_out @ self.B_out).to(dtype=input_dtype)         # [d_out_large, d_out_small]
-            W_proj_full = P @ W_s @ P.transpose(-1, -2)                 # [d_out_large, d_out_large]
-            if W_proj_full.shape[1] != self.input_size_per_partition:
+            P = (self.A_out.to(dev) @ self.B_out.to(dev)).to(dtype=input_dtype)        # [out, out_small]
+            W_proj_full = P @ W_s @ P.transpose(-1, -2)                                # [out, out]
+            if W_proj_full.shape[1] < self.input_size_per_partition:
                 raise RuntimeError(
                     f"[Row symmetric] expects in-per-partition == out; "
                     f"got in_per={self.input_size_per_partition}, out={self.output_size}"
@@ -336,8 +356,8 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         W_proj = self._project_weight_once(input_dtype)
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
         W_base = self.weight.to(dtype=input_dtype)
-        alpha  = self.alpha.to(dtype=input_dtype)
-        return W_base + alpha * W_proj
+        alpha  = self._alpha(dtype=input_dtype)
+        return (1.0 - alpha) * W_base + alpha * W_proj
 
     # Strictly replicate the original Row forward, replacing the final weight used in matmul with our W_eff
     def forward(self, input_):

@@ -375,6 +375,20 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("_cached_proj", None, persistent=False)
 
+    def _projector_params_iter(self):
+        # Iterate over all projector-related parameters
+        names = [
+            "A_out", "B_out", "A_in", "B_in",
+            "A_out_q", "B_out_q", "A_out_k", "B_out_k", "A_out_v", "B_out_v",
+            "alpha", "alpha_logit",  # Depending on which is used; will be included if present
+        ]
+        for n in names:
+            p = getattr(self, n, None)
+            if p is None:
+                continue
+            if isinstance(p, torch.nn.Parameter):
+                yield p
+
     def _alpha(self, dtype):
         return torch.sigmoid(self.alpha_logit).to(dtype=dtype)
 

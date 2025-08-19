@@ -52,7 +52,7 @@ SMALL_MODEL_PATH="/work/hdd/bdrw/klin4/run_gpt_124m/megatron_gpt/checkpoints_124
 LARGE_MODEL_CFG_NAME="megatron_gpt_350m_config"
 PROJECT_DEVICE="cpu"
 TRAIN_DEVICE="cuda"
-RANK=64
+RANK=128
 LEARNABLE=""
 
 # Enable learnable if needed

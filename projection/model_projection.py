@@ -23,10 +23,10 @@ from nemo_utils.model_loader import load_model_to_cpu
 from nemo_utils.model_builder import build_model
 
 class ModelProjectionUtils:
-    def __init__(self, small_model_path, large_model_cfg_path, device="cpu"):
+    def __init__(self, small_model_path, large_model_cfg_path, callbacks, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
-        self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager, self.dtype = self._load_large_model(large_model_cfg_path)
+        self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager, self.dtype = self._load_large_model(large_model_cfg_path, callbacks)
         self._set_dtype(self.dtype)
         self.lora_modules = {}  # name → LoRA projector
 
@@ -47,8 +47,8 @@ class ModelProjectionUtils:
             model = torch.load(path, map_location=self.device)
         return model
 
-    def _load_large_model(self, cfg_name):
-        large_model, trainer, exp_manager, dtype= build_model(cfg_name)
+    def _load_large_model(self, cfg_name, callbacks=None):
+        large_model, trainer, exp_manager, dtype= build_model(cfg_name, callbacks=callbacks)
         return large_model, large_model.state_dict(), trainer, exp_manager, dtype
     
     def get_large_model_trainer(self):

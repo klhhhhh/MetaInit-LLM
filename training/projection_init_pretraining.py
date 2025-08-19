@@ -13,6 +13,7 @@ from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 
 from projection.model_projection import ModelProjectionUtils
+from projection.projection_freeze import FreezeProjectorAtStep
 
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -31,7 +32,14 @@ def main(
 ) -> None:
     logging.info("Loading and projecting small model to large model (CPU stage)...")
 
-    projection_utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, project_device)
+    if learnable:
+        logging.info("Projected parameters will be learnable.")
+        projection_training_callback = [FreezeProjectorAtStep(freeze_at=1000, cache=True, drop_small=True)]
+    else:
+        logging.info("Projected parameters will not be learnable.")
+        projection_training_callback = None
+
+    projection_utils = ModelProjectionUtils(small_model_path, large_model_cfg_name, projection_training_callback, project_device)
     projection_utils.project_parameters(rank=rank, learnable=learnable)
 
     projection_utils.free_small_model()

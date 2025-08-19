@@ -18,7 +18,7 @@ from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import Meg
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from nemo_utils.init_hook import patch_layer
 
-def build_model(cfg_name, map_location="cpu"):
+def build_model(cfg_name, callbacks= None, map_location="cpu"):
     """
     Initialize a MegatronGPTModel from config and place it on the specified device.
 
@@ -41,8 +41,9 @@ def build_model(cfg_name, map_location="cpu"):
 
     dtype = cfg.trainer.precision
 
+    print("Callbacks:", callbacks)
     # Setup trainer
-    trainer = MegatronTrainerBuilder(cfg).create_trainer()
+    trainer = MegatronTrainerBuilder(cfg).create_trainer(callbacks=callbacks)
 
     #Patch the ColumnParallelLinear and RowParallelLinear classes
     patch_layer(ColumnParallelLinear, "ColumnParallelLinear")

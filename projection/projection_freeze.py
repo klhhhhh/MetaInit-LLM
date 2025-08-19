@@ -7,7 +7,7 @@ class FreezeProjectorAtStep(pl.Callback):
       - Optionally cache W_proj_scaled once
       - Optionally release small model weights
     """
-    def __init__(self, *, freeze_at: int = 800, cache: bool = True, drop_small: bool = True):
+    def __init__(self, *, freeze_at: int = 1000, cache: bool = True, drop_small: bool = True):
         super().__init__()
         self.freeze_at = int(freeze_at)
         self.cache = cache
@@ -23,6 +23,9 @@ class FreezeProjectorAtStep(pl.Callback):
         for m in model.modules():
             if isinstance(m, (ColumnParallelLinearWithProjector, RowParallelLinearWithProjector)):
                 yield m
+
+    def on_train_start(self, trainer, pl_module):
+        print(">>>FreezeProjectorAtStep Callback triggered on_train_start")
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if self._done:

@@ -111,8 +111,8 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             # a single in-side projection is still used here (can be split into three sets for q/k/v if required).
             self.A_in, self.B_in = None, None  # For non-square support, please use the asymmetric-in version during initialization.
 
-        # ---- α in [0,1]：用 logit 参数化，便于 schedule/约束 ----
-        # 初始 α≈1e-3 => logit(α) ≈ log(α/(1-α))
+        # ---- α in [0,1]: Parameterized using logit for easier scheduling/constraints ----
+        # Initialize α≈1e-3 => logit(α) ≈ log(α/(1-α))
         alpha0 = 1e-3
         alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
         self.alpha_logit = nn.Parameter(alpha_logit_init)
@@ -120,6 +120,23 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         # Lazy initialization state & proj_scale (one-time norm matching)
         self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
+
+        self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("_cached_proj", None, persistent=False)
+
+    def _projector_params_iter(self):
+        # Iterate over all projector-related parameters
+        names = [
+            "A_out", "B_out", "A_in", "B_in",
+            "A_out_q", "B_out_q", "A_out_k", "B_out_k", "A_out_v", "B_out_v",
+            "alpha", "alpha_logit",  # Depending on which is used; will be included if present
+        ]
+        for n in names:
+            p = getattr(self, n, None)
+            if p is None:
+                continue
+            if isinstance(p, torch.nn.Parameter):
+                yield p
 
     # --- α retrieval (sigmoid constrained to [0,1]) ---
     def _alpha(self, dtype):
@@ -218,8 +235,46 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             # Keep alpha initialized to a small value (already set to 1e-3 in __init__)
             self._proj_inited.data.fill_(1)
 
-    # --- Used in forward: Get the effective weight ---
+    @torch.no_grad()
+    def freeze_projector(self, *, cache: bool = True, drop_small: bool = True):
+        """Freeze projection parameters and α at the current state; optionally cache W_proj_scaled for reuse."""
+        if int(self._proj_frozen.item()) == 1:
+            return  # Idempotent
+
+        # Ensure proj_scale has completed lazy initialization (to prevent caching before initialization)
+        self._lazy_norm_init(self.weight.dtype)
+
+        # Optionally: Cache the "scaled" projection weight (detached, no gradient)
+        if cache:
+            W_proj = self._project_weight_once(self.weight.dtype)  # Compute dynamically
+            self._cached_proj = (self.proj_scale.to(self.weight.dtype) * W_proj).detach()
+
+        # Freeze A/B and alpha (or alpha_logit)
+        for p in self._projector_params_iter():
+            p.requires_grad_(False)
+
+        # Optionally: Release small model weights to save memory
+        if drop_small and hasattr(self, "W_small") and self.W_small is not None:
+            self.W_small = None
+
+        # Mark as frozen
+        self._proj_frozen.data.fill_(1)
+
+    # --- Modification: Retrieve effective weight, prioritize cached values when frozen ---
     def _effective_weight(self, input_dtype: torch.dtype) -> torch.Tensor:
+        # Frozen state: Prefer cached weights; if not cached, compute once (detached, no gradient)
+        if int(self._proj_frozen.item()) == 1:
+            if self._cached_proj is not None:
+                W_proj_scaled = self._cached_proj.to(dtype=input_dtype)
+            else:
+                with torch.no_grad():
+                    W_proj = self._project_weight_once(input_dtype)
+                    W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
+            W_base = self.weight.to(dtype=input_dtype)
+            # α is no longer updated, but its value reflects the parameters at the time of freezing
+            alpha = self._alpha(dtype=input_dtype)
+            return (1.0 - alpha) * W_base + alpha * W_proj_scaled
+
         # 1) Lazy initialization (one-time norm matching)
         self._lazy_norm_init(input_dtype)
 
@@ -317,6 +372,9 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
 
+        self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("_cached_proj", None, persistent=False)
+
     def _alpha(self, dtype):
         return torch.sigmoid(self.alpha_logit).to(dtype=dtype)
 
@@ -353,7 +411,34 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             self.proj_scale.data = scale.to(dtype=self.proj_scale.dtype, device=self.proj_scale.device)
             self._proj_inited.data.fill_(1)
 
+    @torch.no_grad()
+    def freeze_projector(self, *, cache: bool = True, drop_small: bool = True):
+        if int(self._proj_frozen.item()) == 1:
+            return
+        self._lazy_norm_init(self.weight.dtype)
+        if cache:
+            W_proj = self._project_weight_once(self.weight.dtype)
+            self._cached_proj = (self.proj_scale.to(self.weight.dtype) * W_proj).detach()
+        for p in self._projector_params_iter():
+            p.requires_grad_(False)
+        if drop_small and hasattr(self, "W_small") and self.W_small is not None:
+            self.W_small = None
+        self._proj_frozen.data.fill_(1)
+
     def _effective_weight(self, input_dtype: torch.dtype) -> torch.Tensor:
+
+        if int(self._proj_frozen.item()) == 1:
+            if self._cached_proj is not None:
+                W_proj_scaled = self._cached_proj.to(dtype=input_dtype)
+            else:
+                with torch.no_grad():
+                    W_proj = self._project_weight_once(input_dtype)
+                    W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
+            W_base = self.weight.to(dtype=input_dtype)
+            # α is no longer updated, but its value is based on the parameters at the time of freezing
+            alpha  = self._alpha(dtype=input_dtype)
+            return (1.0 - alpha) * W_base + alpha * W_proj_scaled
+
         self._lazy_norm_init(input_dtype)
         W_proj = self._project_weight_once(input_dtype)
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj

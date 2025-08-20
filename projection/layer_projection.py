@@ -273,7 +273,7 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             W_base = self.weight.to(dtype=input_dtype)
             # α is no longer updated, but its value reflects the parameters at the time of freezing
             alpha = self._alpha(dtype=input_dtype)
-            return (1.0 - alpha) * W_base + alpha * W_proj_scaled
+            return W_base + alpha * W_proj_scaled
 
         # 1) Lazy initialization (one-time norm matching)
         self._lazy_norm_init(input_dtype)
@@ -458,7 +458,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
         W_base = self.weight.to(dtype=input_dtype)
         alpha  = self._alpha(dtype=input_dtype)
-        return (1.0 - alpha) * W_base + alpha * W_proj
+        return W_base + alpha * W_proj
 
     # Strictly replicate the original Row forward, replacing the final weight used in matmul with our W_eff
     def forward(self, input_):

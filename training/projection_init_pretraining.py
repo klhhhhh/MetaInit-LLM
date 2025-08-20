@@ -13,7 +13,7 @@ from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 
 from projection.model_projection import ModelProjectionUtils
-from projection.projection_freeze import FreezeProjectorAtStep
+from projection.projection_freeze import AlphaScheduleAndFreeze
 
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -34,7 +34,7 @@ def main(
 
     if learnable:
         logging.info("Projected parameters will be learnable.")
-        projection_training_callback = [FreezeProjectorAtStep(freeze_at=1000, cache=True, drop_small=True)]
+        projection_training_callback = [AlphaScheduleAndFreeze(schedule="cosine", mode="decay", start_value=0.0, end_value=1.0, start_step=0, end_step=20000, freeze_at=1000, cache_on_freeze=True, drop_small_on_freeze=True, verbose=True)]
     else:
         logging.info("Projected parameters will not be learnable.")
         projection_training_callback = None

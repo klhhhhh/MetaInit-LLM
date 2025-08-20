@@ -117,12 +117,21 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
         self.alpha_logit = nn.Parameter(alpha_logit_init)
 
+        self.register_buffer("alpha_mult", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
+
         # Lazy initialization state & proj_scale (one-time norm matching)
         self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
 
         self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("_cached_proj", None, persistent=False)
+
+    @torch.no_grad()
+    def set_alpha_multiplier(self, value: float):
+        # clamp 到 [0, 1.0]；也可允许 >1.0，看你的策略
+        v = float(value)
+        v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+        self.alpha_mult.fill_(v)
 
     def _projector_params_iter(self):
         # Iterate over all projector-related parameters
@@ -138,9 +147,10 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             if isinstance(p, torch.nn.Parameter):
                 yield p
 
-    # --- α retrieval (sigmoid constrained to [0,1]) ---
+    # --- α retrieval ---
     def _alpha(self, dtype):
-        return torch.sigmoid(self.alpha_logit).to(dtype=dtype)
+        # α_eff = sigmoid(alpha_logit) * alpha_mult
+        return torch.sigmoid(self.alpha_logit).to(dtype=dtype) * self.alpha_mult.to(dtype=dtype)
 
     # --- Generate projection weight once ---
     def _project_weight_once(self, input_dtype: torch.dtype) -> torch.Tensor:
@@ -271,9 +281,8 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
                     W_proj = self._project_weight_once(input_dtype)
                     W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
             W_base = self.weight.to(dtype=input_dtype)
-            # α is no longer updated, but its value reflects the parameters at the time of freezing
-            alpha = self._alpha(dtype=input_dtype)
-            return W_base + alpha * W_proj_scaled
+            alpha_eff = self._alpha(dtype=input_dtype)
+            return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj_scaled
 
         # 1) Lazy initialization (one-time norm matching)
         self._lazy_norm_init(input_dtype)
@@ -284,9 +293,8 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
         # 3) Residual fusion: W_eff = W_base + alpha * W_proj
         W_base = self.weight.to(dtype=input_dtype)
-        alpha  = self._alpha(dtype=input_dtype)
-
-        return (1.0 - alpha) * W_base + alpha * W_proj
+        alpha_eff = self._alpha(dtype=input_dtype)
+        return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj
 
     # --- Override forward, inject weight, reuse parent logic ---
     def forward(self, input_, weight=None, runtime_gather_output=None):
@@ -369,11 +377,20 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
         self.alpha_logit = nn.Parameter(alpha_logit_init)
 
+        self.register_buffer("alpha_mult", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
+
         self.register_buffer("_proj_inited", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("proj_scale", torch.tensor(1.0, device=device, dtype=dtype), persistent=False)
 
         self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("_cached_proj", None, persistent=False)
+
+    @torch.no_grad()
+    def set_alpha_multiplier(self, value: float):
+        # clamp 到 [0, 1.0]；也可允许 >1.0，看你的策略
+        v = float(value)
+        v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+        self.alpha_mult.fill_(v)
 
     def _projector_params_iter(self):
         # Iterate over all projector-related parameters
@@ -389,8 +406,10 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             if isinstance(p, torch.nn.Parameter):
                 yield p
 
+    # --- α retrieval ---
     def _alpha(self, dtype):
-        return torch.sigmoid(self.alpha_logit).to(dtype=dtype)
+        # α_eff = sigmoid(alpha_logit) * alpha_mult
+        return torch.sigmoid(self.alpha_logit).to(dtype=dtype) * self.alpha_mult.to(dtype=dtype)
 
     def _project_weight_once(self, input_dtype: torch.dtype) -> torch.Tensor:
         dev = self.weight.device
@@ -439,8 +458,9 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             self.W_small = None
         self._proj_frozen.data.fill_(1)
 
+    # --- Modification: Retrieve effective weight, prioritize cached values when frozen ---
     def _effective_weight(self, input_dtype: torch.dtype) -> torch.Tensor:
-
+        # Frozen state: Prefer cached weights; if not cached, compute once (detached, no gradient)
         if int(self._proj_frozen.item()) == 1:
             if self._cached_proj is not None:
                 W_proj_scaled = self._cached_proj.to(dtype=input_dtype)
@@ -449,16 +469,15 @@ class RowParallelLinearWithProjector(RowParallelLinear):
                     W_proj = self._project_weight_once(input_dtype)
                     W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
             W_base = self.weight.to(dtype=input_dtype)
-            # α is no longer updated, but its value is based on the parameters at the time of freezing
-            alpha  = self._alpha(dtype=input_dtype)
-            return (1.0 - alpha) * W_base + alpha * W_proj_scaled
+            alpha_eff = self._alpha(dtype=input_dtype)
+            return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj_scaled
 
         self._lazy_norm_init(input_dtype)
         W_proj = self._project_weight_once(input_dtype)
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
         W_base = self.weight.to(dtype=input_dtype)
-        alpha  = self._alpha(dtype=input_dtype)
-        return W_base + alpha * W_proj
+        alpha_eff = self._alpha(dtype=input_dtype)
+        return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj
 
     # Strictly replicate the original Row forward, replacing the final weight used in matmul with our W_eff
     def forward(self, input_):

@@ -16,7 +16,7 @@ class AlphaScheduleAndFreeze(pl.Callback):
         start_value: float = 1.0,
         end_value: float = 0.05,
         start_step: int = 0,
-        end_step: int = 10_000,
+        end_step: int = 10000,
         freeze_at: int | None = None,
         cache_on_freeze: bool = True,
         drop_small_on_freeze: bool = True,

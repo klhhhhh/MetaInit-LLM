@@ -128,7 +128,7 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
     @torch.no_grad()
     def set_alpha_multiplier(self, value: float):
-        # clamp 到 [0, 1.0]；也可允许 >1.0，看你的策略
+        # Clamp the value to [0, 1.0]; allowing >1.0 depends on your strategy
         v = float(value)
         v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
         self.alpha_mult.fill_(v)
@@ -387,7 +387,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
 
     @torch.no_grad()
     def set_alpha_multiplier(self, value: float):
-        # clamp 到 [0, 1.0]；也可允许 >1.0，看你的策略
+        # Clamp the value to [0, 1.0]; allowing >1.0 depends on your strategy
         v = float(value)
         v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
         self.alpha_mult.fill_(v)

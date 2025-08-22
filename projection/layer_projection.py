@@ -11,13 +11,23 @@ import torch.nn.functional as F
 # ------------------------------------------------
 # Small-variance low-rank initialization; consistent with the original code style
 # ------------------------------------------------
-def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype):
+def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype, method="orthogonal"):
     A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
     B = nn.Parameter(torch.empty(rank, in_dim_small, device=device, dtype=dtype))
-    # Small-variance Gaussian initialization to avoid overly strong projections. Scaled in a fan-in style.
-    torch.nn.init.normal_(A, mean=0.0, std=(1.0 / max(1, in_dim_small) ** 0.5))
-    torch.nn.init.normal_(B, mean=0.0, std=(1.0 / max(1, rank) ** 0.5))
+
+    if method == "orthogonal":
+        # Orthogonal initialization: Ensures rows/columns are orthogonal
+        torch.nn.init.orthogonal_(A)
+        torch.nn.init.orthogonal_(B)
+    elif method == "normal":
+        # Gaussian fan-in initialization (original method used)
+        torch.nn.init.normal_(A, mean=0.0, std=(1.0 / max(1, in_dim_small) ** 0.5))
+        torch.nn.init.normal_(B, mean=0.0, std=(1.0 / max(1, rank) ** 0.5))
+    else:
+        raise ValueError(f"Unknown init method: {method}")
+
     return A, B
+
 
 
 # === Utility: Fold Frobenius norm scaling into A / B (symmetric case) ===

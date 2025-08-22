@@ -20,6 +20,59 @@ def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype):
     return A, B
 
 
+# === Utility: Fold Frobenius norm scaling into A / B (symmetric case) ===
+@torch.no_grad()
+def _fold_scale_into_AB(A: nn.Parameter,
+                        B: nn.Parameter,
+                        target_norm: torch.Tensor,
+                        current_Wproj_norm: torch.Tensor,
+                        eps: float = 1e-12) -> None:
+    """
+    Goal: Ensure the projected weight satisfies ||W_proj_new||_F ≈ ||W_base||_F.
+    Symmetric case: W_proj = (A B) W_s (A B)^T.
+    Let s = ||W_base||_F / (||W_proj||_F + eps).
+    To scale W_proj by s, scale P = A B by s^(1/2), which means multiplying s^(1/4) to both A and B:
+        A <- s^(1/4) * A
+        B <- s^(1/4) * B
+    This avoids in-place operations like .mul_, using torch.mul(..., out=...) or assignment instead for clarity.
+    """
+    s = target_norm / (current_Wproj_norm + eps)
+    s = torch.clamp(s, min=0.0)
+    gain = torch.sqrt(torch.sqrt(s))  # s^(1/4)
+    gain = gain.to(device=A.device, dtype=A.dtype)
+
+    # Explicit update: A = gain * A (write back to A.data)
+    torch.mul(A.data, gain, out=A.data)
+    torch.mul(B.data, gain, out=B.data)
+
+
+# === Utility: Fold Frobenius norm scaling into A_out/B_out/A_in/B_in (asymmetric case) ===
+@torch.no_grad()
+def _fold_scale_into_two_AB_pairs(A_out: nn.Parameter,
+                                  B_out: nn.Parameter,
+                                  A_in: nn.Parameter,
+                                  B_in: nn.Parameter,
+                                  target_norm: torch.Tensor,
+                                  current_Wproj_norm: torch.Tensor,
+                                  eps: float = 1e-12) -> None:
+    """
+    Asymmetric case: W_proj = (A_out B_out) W_s (A_in B_in)^T.
+    To scale W_proj by s, scale both P_out and P_in by s^(1/2),
+    which means multiplying s^(1/4) to all four matrices:
+        A_out <- s^(1/4) * A_out,  B_out <- s^(1/4) * B_out,
+        A_in  <- s^(1/4) * A_in,   B_in  <- s^(1/4) * B_in
+    """
+    s = target_norm / (current_Wproj_norm + eps)
+    s = torch.clamp(s, min=0.0)
+    gain = torch.sqrt(torch.sqrt(s))
+    gain = gain.to(device=A_out.device, dtype=A_out.dtype)
+
+    torch.mul(A_out.data, gain, out=A_out.data)
+    torch.mul(B_out.data, gain, out=B_out.data)
+    torch.mul(A_in.data,  gain, out=A_in.data)
+    torch.mul(B_in.data,  gain, out=B_in.data)
+
+
 # ===============================================
 #  ColumnParallelLinear + Learnable Projector (α)
 # ===============================================
@@ -126,6 +179,13 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("_cached_proj", None, persistent=False)
 
+            # --- During initialization, attempt one-time warm-start and fold scaling into A/B (skip lazy_norm_init if successful) ---
+            try:
+                self._warmstart_and_fold_scale_if_possible()
+            except Exception:
+                # If shape/square matrix conditions are not met or an exception occurs, retain the original logic: perform lazy_norm_init during the first forward pass
+                pass
+
     @torch.no_grad()
     def set_alpha_multiplier(self, value: float):
         # Clamp the value to [0, 1.0]; allowing >1.0 depends on your strategy
@@ -227,6 +287,68 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             W_k_proj = P_k @ W_k @ P_in.transpose(-1, -2)
             W_v_proj = P_v @ W_v @ P_in.transpose(-1, -2)
             return torch.cat([W_q_proj, W_k_proj, W_v_proj], dim=0)
+
+    # --- Warm-start initialization + folding (skip lazy_norm_init if successful) ---
+    @torch.no_grad()
+    def _warmstart_and_fold_scale_if_possible(self):
+        # Preconditions: W_small exists and is not frozen
+        if getattr(self, "W_small", None) is None:
+            return
+        if int(getattr(self, "_proj_frozen", torch.tensor(0)).item()) == 1:
+            return
+
+        # Attempt to construct W_proj; if shape/square matrix conditions are not met, an exception is raised
+        try:
+            W_proj = self._project_weight_once(self.weight.dtype)
+        except Exception:
+            return
+
+        W_base = self.weight.to(dtype=self.weight.dtype)
+        target = torch.linalg.norm(W_base, ord='fro')
+        current = torch.linalg.norm(W_proj, ord='fro')
+        if current <= 0:
+            return
+
+        if self.projection_type == "symmetric":
+            _fold_scale_into_AB(self.A_out, self.B_out, target, current)
+
+        elif self.projection_type == "asymmetric":
+            _fold_scale_into_two_AB_pairs(self.A_out, self.B_out, self.A_in, self.B_in, target, current)
+
+        else:  # qkv
+            # Compute norms for q/k/v blocks separately and fold
+            dev = self.weight.device
+            W_s = self.W_small.to(device=dev, dtype=self.weight.dtype)
+            d_out_s_per = W_s.shape[0] // 3
+
+            W_q = W_s[0:               d_out_s_per, :]
+            W_k = W_s[d_out_s_per:2*d_out_s_per, :]
+            W_v = W_s[2*d_out_s_per:3*d_out_s_per, :]
+
+            # q
+            P_q = (self.A_out_q @ self.B_out_q)
+            W_q_proj_try = P_q @ W_q @ P_q.transpose(-1, -2)
+            norm_q = torch.linalg.norm(W_q_proj_try, 'fro')
+            if norm_q > 0:
+                _fold_scale_into_AB(self.A_out_q, self.B_out_q, target, norm_q)
+
+            # k
+            P_k = (self.A_out_k @ self.B_out_k)
+            W_k_proj_try = P_k @ W_k @ P_k.transpose(-1, -2)
+            norm_k = torch.linalg.norm(W_k_proj_try, 'fro')
+            if norm_k > 0:
+                _fold_scale_into_AB(self.A_out_k, self.B_out_k, target, norm_k)
+
+            # v
+            P_v = (self.A_out_v @ self.B_out_v)
+            W_v_proj_try = P_v @ W_v @ P_v.transpose(-1, -2)
+            norm_v = torch.linalg.norm(W_v_proj_try, 'fro')
+            if norm_v > 0:
+                _fold_scale_into_AB(self.A_out_v, self.B_out_v, target, norm_v)
+
+        # Folding successful: no need to multiply proj_scale in subsequent steps
+        self.proj_scale.data.fill_(1.0)
+        self._proj_inited.data.fill_(1)
 
     # --- Lazy initialization: one-time norm matching ---
     def _lazy_norm_init(self, input_dtype: torch.dtype):
@@ -385,6 +507,13 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("_cached_proj", None, persistent=False)
 
+        # Attempt to perform one-time warm-start initialization and fold scaling into A/B (skip lazy_norm_init if successful)
+        try:
+            self._warmstart_and_fold_scale_if_possible()
+        except Exception:
+            # If shape/square matrix conditions are not met or an exception occurs, retain the original logic: perform lazy_norm_init during the first forward pass
+            pass
+
     @torch.no_grad()
     def set_alpha_multiplier(self, value: float):
         # Clamp the value to [0, 1.0]; allowing >1.0 depends on your strategy
@@ -430,6 +559,69 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             P_in  = (self.A_in  @ self.B_in ).to(dtype=input_dtype)     # [d_in_large,  d_in_small]
             W_proj = P_out @ W_s @ P_in.transpose(-1, -2)               # [d_out_large, d_in_large]
             return W_proj  # Its column dimension already equals in_per_partition
+
+    # --- Warm-start initialization + folding (skip lazy_norm_init if successful) ---
+    @torch.no_grad()
+    def _warmstart_and_fold_scale_if_possible(self):
+        # Preconditions: W_small exists and is not frozen
+        if getattr(self, "W_small", None) is None:
+            return
+        if int(getattr(self, "_proj_frozen", torch.tensor(0)).item()) == 1:
+            return
+
+        # Attempt to construct W_proj; if shape/square matrix conditions are not met, an exception is raised
+        try:
+            W_proj = self._project_weight_once(self.weight.dtype)
+        except Exception:
+            return
+
+        W_base = self.weight.to(dtype=self.weight.dtype)
+        target = torch.linalg.norm(W_base, ord='fro')
+        current = torch.linalg.norm(W_proj, ord='fro')
+        if current <= 0:
+            return
+
+        if self.projection_type == "symmetric":
+            _fold_scale_into_AB(self.A_out, self.B_out, target, current)
+
+        elif self.projection_type == "asymmetric":
+            _fold_scale_into_two_AB_pairs(self.A_out, self.B_out, self.A_in, self.B_in, target, current)
+
+        else:  # qkv
+            # Compute norms for q/k/v blocks separately and fold
+            dev = self.weight.device
+            W_s = self.W_small.to(device=dev, dtype=self.weight.dtype)
+            d_out_s_per = W_s.shape[0] // 3
+
+            W_q = W_s[0:               d_out_s_per, :]
+            W_k = W_s[d_out_s_per:2*d_out_s_per, :]
+            W_v = W_s[2*d_out_s_per:3*d_out_s_per, :]
+
+            # q
+            P_q = (self.A_out_q @ self.B_out_q)
+            W_q_proj_try = P_q @ W_q @ P_q.transpose(-1, -2)
+            norm_q = torch.linalg.norm(W_q_proj_try, 'fro')
+            if norm_q > 0:
+                _fold_scale_into_AB(self.A_out_q, self.B_out_q, target, norm_q)
+
+            # k
+            P_k = (self.A_out_k @ self.B_out_k)
+            W_k_proj_try = P_k @ W_k @ P_k.transpose(-1, -2)
+            norm_k = torch.linalg.norm(W_k_proj_try, 'fro')
+            if norm_k > 0:
+                _fold_scale_into_AB(self.A_out_k, self.B_out_k, target, norm_k)
+
+            # v
+            P_v = (self.A_out_v @ self.B_out_v)
+            W_v_proj_try = P_v @ W_v @ P_v.transpose(-1, -2)
+            norm_v = torch.linalg.norm(W_v_proj_try, 'fro')
+            if norm_v > 0:
+                _fold_scale_into_AB(self.A_out_v, self.B_out_v, target, norm_v)
+
+        # Folding successful: no need to multiply proj_scale in subsequent steps
+        self.proj_scale.data.fill_(1.0)
+        self._proj_inited.data.fill_(1)
+
 
     def _lazy_norm_init(self, input_dtype: torch.dtype):
         if int(self._proj_inited.item()) == 1:

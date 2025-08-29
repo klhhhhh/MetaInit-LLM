@@ -1,5 +1,6 @@
 import math
 import pytorch_lightning as pl
+import torch
 
 class AlphaScheduleAndFreeze(pl.Callback):
     """

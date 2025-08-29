@@ -190,11 +190,11 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         self.register_buffer("_cached_proj", None, persistent=False)
 
             # --- During initialization, attempt one-time warm-start and fold scaling into A/B (skip lazy_norm_init if successful) ---
-            try:
-                self._warmstart_and_fold_scale_if_possible()
-            except Exception:
-                # If shape/square matrix conditions are not met or an exception occurs, retain the original logic: perform lazy_norm_init during the first forward pass
-                pass
+        try:
+            self._warmstart_and_fold_scale_if_possible()
+        except Exception:
+            # If shape/square matrix conditions are not met or an exception occurs, retain the original logic: perform lazy_norm_init during the first forward pass
+            pass
 
     @torch.no_grad()
     def set_alpha_multiplier(self, value: float):

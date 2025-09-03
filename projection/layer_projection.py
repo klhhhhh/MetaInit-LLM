@@ -11,7 +11,7 @@ import torch.nn.functional as F
 # ------------------------------------------------
 # Small-variance low-rank initialization; consistent with the original code style
 # ------------------------------------------------
-def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype, method="orthogonal"):
+def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype, method="normal", the_same_with_weight=False, init_method_function=None):
     A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
     B = nn.Parameter(torch.empty(rank, in_dim_small, device=device, dtype=dtype))
 
@@ -21,8 +21,13 @@ def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype, method="orthogonal
         torch.nn.init.orthogonal_(B)
     elif method == "normal":
         # Gaussian fan-in initialization (original method used)
-        torch.nn.init.normal_(A, mean=0.0, std=(1.0 / max(1, in_dim_small) ** 0.5))
-        torch.nn.init.normal_(B, mean=0.0, std=(1.0 / max(1, rank) ** 0.5))
+        if the_same_with_weight:
+            assert init_method_function is not None, "init_method_function must be provided when the_same_with_weight is True"
+            init_method_function(A)
+            init_method_function(B)
+        else:
+            torch.nn.init.normal_(A, mean=0.0, std=(1.0 / max(1, in_dim_small) ** 0.5))
+            torch.nn.init.normal_(B, mean=0.0, std=(1.0 / max(1, rank) ** 0.5))
     else:
         raise ValueError(f"Unknown init method: {method}")
 
@@ -82,6 +87,28 @@ def _fold_scale_into_two_AB_pairs(A_out: nn.Parameter,
     torch.mul(A_in.data,  gain, out=A_in.data)
     torch.mul(B_in.data,  gain, out=B_in.data)
 
+@torch.no_grad()
+def _compute_per_channel_scale_from_base(W_proj: torch.Tensor,
+                                         W_base: torch.Tensor,
+                                         eps: float = 1e-8) -> torch.Tensor:
+    """
+    Compute per-channel (per-row) scaling factors such that the per-channel std of scaled(W_proj)
+    matches the per-channel std of W_base.
+    Returns a scaling vector of shape [out, 1] for row-wise scaling.
+    """
+    # Compute std along the output channel (weights are [out, in])
+    tgt = W_base.std(dim=1, keepdim=True).clamp_min(eps)   # [out, 1]
+    cur = W_proj.std(dim=1, keepdim=True).clamp_min(eps)   # [out, 1]
+    scale = tgt / cur                                      # [out, 1]
+    return scale
+
+@torch.no_grad()
+def _apply_per_channel_scale_(W: torch.Tensor, scale: torch.Tensor):
+    """
+    In-place per-channel scaling: W <- scale * W
+    Where W: [out, in], scale: [out, 1]
+    """
+    W.mul_(scale)
 
 # ===============================================
 #  ColumnParallelLinear + Learnable Projector (α)
@@ -188,6 +215,8 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
         self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("_cached_proj", None, persistent=False)
+
+        self.register_buffer("per_channel_scale", torch.ones(d_out_large, 1, device=device, dtype=dtype), persistent=False)
 
             # --- During initialization, attempt one-time warm-start and fold scaling into A/B (skip lazy_norm_init if successful) ---
         try:
@@ -356,6 +385,15 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
             if norm_v > 0:
                 _fold_scale_into_AB(self.A_out_v, self.B_out_v, target, norm_v)
 
+        
+        # === New: per-channel variance match (after folding Fro scaling) ===
+        W_proj_try = self._project_weight_once(self.weight.dtype)                  # [out, in]
+        W_proj_try = (self.proj_scale.to(W_proj_try.dtype) * W_proj_try)          # Multiply by scalar first
+        W_base_try = self.weight.to(dtype=W_proj_try.dtype)
+
+        scale_pc = _compute_per_channel_scale_from_base(W_proj_try, W_base_try)   # [out, 1]
+        self.per_channel_scale.copy_(scale_pc)                                    # Save scaling vector
+
         # Folding successful: no need to multiply proj_scale in subsequent steps
         self.proj_scale.data.fill_(1.0)
         self._proj_inited.data.fill_(1)
@@ -412,6 +450,8 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
                 with torch.no_grad():
                     W_proj = self._project_weight_once(input_dtype)
                     W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
+
+            _apply_per_channel_scale_(W_proj_scaled, self.per_channel_scale.to(dtype=input_dtype))
             W_base = self.weight.to(dtype=input_dtype)
             alpha_eff = self._alpha(dtype=input_dtype)
             return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj_scaled
@@ -422,6 +462,10 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         # 2) Generate W_proj and scale it
         W_proj = self._project_weight_once(input_dtype)
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
+
+        # After generating W_proj_scaled, apply per-channel scaling
+        _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=input_dtype))
+
 
         # 3) Residual fusion: W_eff = W_base + alpha * W_proj
         W_base = self.weight.to(dtype=input_dtype)
@@ -516,6 +560,8 @@ class RowParallelLinearWithProjector(RowParallelLinear):
 
         self.register_buffer("_proj_frozen", torch.tensor(0, dtype=torch.int8), persistent=False)
         self.register_buffer("_cached_proj", None, persistent=False)
+
+        self.register_buffer("per_channel_scale", torch.ones(d_out_large, 1, device=device, dtype=dtype), persistent=False)
 
         # Attempt to perform one-time warm-start initialization and fold scaling into A/B (skip lazy_norm_init if successful)
         try:
@@ -627,6 +673,13 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             norm_v = torch.linalg.norm(W_v_proj_try, 'fro')
             if norm_v > 0:
                 _fold_scale_into_AB(self.A_out_v, self.B_out_v, target, norm_v)
+        
+        W_proj_try = self._project_weight_once(self.weight.dtype)                  # [out, in]
+        W_proj_try = (self.proj_scale.to(W_proj_try.dtype) * W_proj_try)          # Multiply by scalar first
+        W_base_try = self.weight.to(dtype=W_proj_try.dtype)
+
+        scale_pc = _compute_per_channel_scale_from_base(W_proj_try, W_base_try)   # [out, 1]
+        self.per_channel_scale.copy_(scale_pc)                                    # Save scaling vector
 
         # Folding successful: no need to multiply proj_scale in subsequent steps
         self.proj_scale.data.fill_(1.0)
@@ -670,6 +723,8 @@ class RowParallelLinearWithProjector(RowParallelLinear):
                 with torch.no_grad():
                     W_proj = self._project_weight_once(input_dtype)
                     W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
+
+            _apply_per_channel_scale_(W_proj_scaled, self.per_channel_scale.to(dtype=input_dtype))
             W_base = self.weight.to(dtype=input_dtype)
             alpha_eff = self._alpha(dtype=input_dtype)
             return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj_scaled
@@ -677,6 +732,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         self._lazy_norm_init(input_dtype)
         W_proj = self._project_weight_once(input_dtype)
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
+        _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=input_dtype))
         W_base = self.weight.to(dtype=input_dtype)
         alpha_eff = self._alpha(dtype=input_dtype)
         return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj

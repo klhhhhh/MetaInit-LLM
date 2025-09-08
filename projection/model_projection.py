@@ -175,19 +175,19 @@ class ModelProjectionUtils:
         out_large, in_large = target_shape
         assert out_large == in_large, "symmetric projection is only used for square matrices"
 
-        A, B = _orthogonal_factors(out_large, W_small.shape[0], rank, W_small.device, spectral_scale)
+        A, B = self._orthogonal_factors(out_large, W_small.shape[0], rank, W_small.device, spectral_scale)
         P = A @ B                                 # [out_large, out_small]
         W_large = P @ W_small @ P.T               # [out_large, out_large]
 
         # Additional scaling for Q/K weights (if this is q or k weights)
         if num_heads is not None and (is_q or is_k):
-            W_large = _apply_qk_head_scaling(W_large, num_heads)
+            W_large = self._apply_qk_head_scaling(W_large, num_heads)
 
-        W_large = normalize_projection(W_large, target_param)  # Row-wise std alignment
+        W_large = self.normalize_projection(W_large, target_param)  # Row-wise std alignment
         return W_large
 
 
-    def lora_style_projection_asymmetric(self, W_small, target_shape, target_param, projection_rank=32, spectral_scale=0.1):
+    def lora_style_projection_asymmetric(self, W_small, target_shape, target_param, rank=32, spectral_scale=0.1):
         """
         Perform LoRA-style low-rank projection with additional factorization (projection_rank) to reduce computation.
         
@@ -202,11 +202,11 @@ class ModelProjectionUtils:
         out_large, in_large = target_shape
         out_small, in_small = W_small.shape
 
-        A1, A2 = _orthogonal_factors(out_large, out_small, rank, W_small.device, spectral_scale)
-        B1, B2 = _orthogonal_factors(in_small, in_large, rank, W_small.device, spectral_scale)
+        A1, A2 = self._orthogonal_factors(out_large, out_small, rank, W_small.device, spectral_scale)
+        B1, B2 = self._orthogonal_factors(in_small, in_large, rank, W_small.device, spectral_scale)
         # W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
         W_large = (A1 @ (A2 @ W_small @ B1)) @ B2
-        W_large = normalize_projection(W_large, target_param)  # Row-wise std alignment
+        W_large = self.normalize_projection(W_large, target_param)  # Row-wise std alignment
         return W_large
 
     def _bind_init_kwargs_from_record(self, layer, rec: dict) -> dict:

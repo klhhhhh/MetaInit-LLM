@@ -40,8 +40,8 @@ def build_model(cfg_name, callbacks= None, map_location="cpu"):
     logging.info("************** Initializing Model **************")
 
     dtype = cfg.trainer.precision
+    num_heads = cfg.model.num_attention_heads
 
-    print("Callbacks:", callbacks)
     # Setup trainer
     trainer = MegatronTrainerBuilder(cfg).create_trainer(callbacks=callbacks)
 
@@ -52,7 +52,7 @@ def build_model(cfg_name, callbacks= None, map_location="cpu"):
     # Instantiate the model
     model = MegatronGPTModel(cfg.model, trainer)
 
-    return model, trainer, cfg.exp_manager, dtype
+    return model, trainer, cfg.exp_manager, dtype, num_heads
 
 if __name__ == "__main__":
 

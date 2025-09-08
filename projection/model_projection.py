@@ -48,7 +48,7 @@ class ModelProjectionUtils:
         return model
 
     def _load_large_model(self, cfg_name, callbacks=None):
-        large_model, trainer, exp_manager, dtype= build_model(cfg_name, callbacks=callbacks)
+        large_model, trainer, exp_manager, dtype, num_heads = build_model(cfg_name, callbacks=callbacks)
         return large_model, large_model.state_dict(), trainer, exp_manager, dtype, num_heads
     
     def get_large_model_trainer(self):

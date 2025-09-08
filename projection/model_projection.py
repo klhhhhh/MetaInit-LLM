@@ -26,7 +26,7 @@ class ModelProjectionUtils:
     def __init__(self, small_model_path, large_model_cfg_path, callbacks, device="cpu"):
         self.device = device
         self.small_model = self._load_small_model(small_model_path)
-        self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager, self.dtype = self._load_large_model(large_model_cfg_path, callbacks)
+        self.large_model, self.large_state_dict, self.large_trainer, self.large_exp_manager, self.dtype, self.num_heads = self._load_large_model(large_model_cfg_path, callbacks)
         self._set_dtype(self.dtype)
         self.lora_modules = {}  # name → LoRA projector
 
@@ -49,7 +49,7 @@ class ModelProjectionUtils:
 
     def _load_large_model(self, cfg_name, callbacks=None):
         large_model, trainer, exp_manager, dtype= build_model(cfg_name, callbacks=callbacks)
-        return large_model, large_model.state_dict(), trainer, exp_manager, dtype
+        return large_model, large_model.state_dict(), trainer, exp_manager, dtype, num_heads
     
     def get_large_model_trainer(self):
         """
@@ -101,6 +101,43 @@ class ModelProjectionUtils:
             print(f"Normalizing projection from {projected_norm:.4f} to {target_norm:.4f}")
             W_projected = W_projected * (target_norm / projected_norm)
         return W_projected
+    
+    def normalize_projection(self, W_large: torch.Tensor, target_param: torch.Tensor,
+                            nonlin: str = 'gelu', use_target_stats: bool = True,
+                            eps: float = 1e-8) -> torch.Tensor:
+        """
+        Perform one-time calibration of the projected weights W_large:
+        - By default, align to the row-wise std of target_param (most stable).
+        - If a suitable target_param is not available, fallback to fan-in theoretical std (Xavier/He initialization).
+        """
+        W = W_large
+        if use_target_stats and target_param is not None and target_param.numel() > 0 \
+        and target_param.shape == W.shape:
+            tgt = target_param.std(dim=1, keepdim=True).clamp_min(eps)  # [out,1]
+        else:
+            # Fan-in target: gain / sqrt(fan_in)
+            fan_in = W.size(1)
+            gain = (2.0 ** 0.5) if nonlin in ('relu', 'gelu') else 1.0
+            tgt_val = gain / (fan_in ** 0.5)
+            tgt = W.new_full((W.size(0), 1), tgt_val)
+
+        cur = W.std(dim=1, keepdim=True).clamp_min(eps)
+        scale = tgt / cur
+        return W * scale  # Row-wise scaling
+
+    def _orthogonal_factors(self, out_dim, in_dim_small, rank, device, spectral_scale=0.1):
+        A = torch.empty(out_dim, rank, device=device)
+        B = torch.empty(rank, in_dim_small, device=device)
+        torch.nn.init.orthogonal_(A)        # Columns of A are approximately orthogonal
+        torch.nn.init.orthogonal_(B.T)      # Rows of B are approximately orthogonal -> Columns of B are approximately orthogonal
+        A.mul_(spectral_scale)
+        B.mul_(spectral_scale)
+        return A, B
+    
+    def _apply_qk_head_scaling(self, W_q_or_k: torch.Tensor, num_heads: int):
+        d_head = W_q_or_k.size(0) // num_heads
+        return W_q_or_k / (d_head ** 0.5)
+
 
     def dispatch_projection(self, name, W_small, target_shape, target_param, projection_rank=32):
         """
@@ -113,17 +150,15 @@ class ModelProjectionUtils:
 
         if "linear_qkv.weight" in name and W_small.shape[0] % 3 == 0:
             # Split into Q, K, V
-            qkv_chunks = torch.chunk(W_small, 3, dim=0)
+            q, k, v = torch.chunk(W_small, 3, dim=0)
             out_chunks = target_shape[0] // 3
-            W_large_chunks = []
-
-            for i, qkv in enumerate(qkv_chunks):
-                projected = self.lora_style_projection_symmetric(
-                    qkv, (out_chunks, target_shape[1]), target_param, projection_rank
-                )
-                W_large_chunks.append(projected)
-
-            return torch.cat(W_large_chunks, dim=0)
+            Wq = self.lora_style_projection_symmetric(q, (out_chunks, target_shape[1]), target_param[:out_chunks, :out_chunks],
+                                                    projection_rank, num_heads=self.num_heads, is_q=True)
+            Wk = self.lora_style_projection_symmetric(k, (out_chunks, target_shape[1]), target_param[out_chunks:2*out_chunks, out_chunks:2*out_chunks],
+                                                    projection_rank, num_heads=self.num_heads, is_k=True)
+            Wv = self.lora_style_projection_symmetric(v, (out_chunks, target_shape[1]), target_param[2*out_chunks:, 2*out_chunks:],
+                                                    projection_rank)
+            return torch.cat([Wq, Wk, Wv], dim=0)
 
         elif "linear_proj.weight" in name:
             return self.lora_style_projection_symmetric(W_small, target_shape, target_param, projection_rank)
@@ -134,25 +169,25 @@ class ModelProjectionUtils:
         else:
             # Default to symmetric projection (you can also raise a warning)
             return self.lora_style_projection_symmetric(W_small, target_shape, target_param, projection_rank)
-
     
-    def lora_style_projection_symmetric(self, W_small, target_shape, target_param, rank=32):
-        """
-        Symmetric LoRA projection: W_large = P @ W_small @ P^T
-        Suitable for matrices like self_attention.linear_proj.weight with shape [h, h].
-        """
-        d_out, d_in = target_shape
-        d_s_out, d_s_in = W_small.shape
+    def lora_style_projection_symmetric(self, W_small, target_shape, target_param, rank=32,
+                                    spectral_scale=0.1, num_heads=None, is_q=False, is_k=False):
+        out_large, in_large = target_shape
+        assert out_large == in_large, "symmetric projection is only used for square matrices"
 
-        A = torch.randn(d_out, rank, device=W_small.device) * 0.01
-        B = torch.randn(rank, d_s_out, device=W_small.device) * 0.01
-        P = A @ B  # [d_out, d_s_out]
+        A, B = _orthogonal_factors(out_large, W_small.shape[0], rank, W_small.device, spectral_scale)
+        P = A @ B                                 # [out_large, out_small]
+        W_large = P @ W_small @ P.T               # [out_large, out_large]
 
-        W_large = P @ W_small @ P.T  # [d_out, d_out]
-        W_large = self.normalize_projection(W_large, target_param)
+        # Additional scaling for Q/K weights (if this is q or k weights)
+        if num_heads is not None and (is_q or is_k):
+            W_large = _apply_qk_head_scaling(W_large, num_heads)
+
+        W_large = normalize_projection(W_large, target_param)  # Row-wise std alignment
         return W_large
 
-    def lora_style_projection_asymmetric(self, W_small, target_shape, target_param, projection_rank=32):
+
+    def lora_style_projection_asymmetric(self, W_small, target_shape, target_param, projection_rank=32, spectral_scale=0.1):
         """
         Perform LoRA-style low-rank projection with additional factorization (projection_rank) to reduce computation.
         
@@ -167,15 +202,11 @@ class ModelProjectionUtils:
         out_large, in_large = target_shape
         out_small, in_small = W_small.shape
 
-        # Low-rank factors for A and B
-        A1 = torch.randn(out_large, projection_rank, device=W_small.device) * 0.01
-        A2 = torch.randn(projection_rank, out_small, device=W_small.device) * 0.01
-        B1 = torch.randn(in_small, projection_rank, device=W_small.device) * 0.01
-        B2 = torch.randn(projection_rank, in_large, device=W_small.device) * 0.01
-
-        # Final projection: W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
-        W_large = (A1 @ (A2 @ W_small @ B1)) @ B2  # shape: [out_large, in_large]
-        W_large = self.normalize_projection(W_large, target_param)
+        A1, A2 = _orthogonal_factors(out_large, out_small, rank, W_small.device, spectral_scale)
+        B1, B2 = _orthogonal_factors(in_small, in_large, rank, W_small.device, spectral_scale)
+        # W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
+        W_large = (A1 @ (A2 @ W_small @ B1)) @ B2
+        W_large = normalize_projection(W_large, target_param)  # Row-wise std alignment
         return W_large
 
     def _bind_init_kwargs_from_record(self, layer, rec: dict) -> dict:

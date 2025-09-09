@@ -11,7 +11,7 @@ import torch.nn.functional as F
 # ------------------------------------------------
 # Small-variance low-rank initialization; consistent with the original code style
 # ------------------------------------------------
-def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype, method="normal", the_same_with_weight=False, init_method_function=None):
+def _init_AB_pair(out_dim, in_dim_small, rank, device, dtype, method="orthogonal", the_same_with_weight=False, init_method_function=None):
     A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
     B = nn.Parameter(torch.empty(rank, in_dim_small, device=device, dtype=dtype))
 
@@ -203,7 +203,7 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
         # ---- α in [0,1]: Parameterized using logit for easier scheduling/constraints ----
         # Initialize α≈1e-3 => logit(α) ≈ log(α/(1-α))
-        alpha0 = 1e-3
+        alpha0 = 1e-1
         alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
         self.alpha_logit = nn.Parameter(alpha_logit_init)
 
@@ -427,7 +427,12 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         # Optionally: Cache the "scaled" projection weight (detached, no gradient)
         if cache:
             W_proj = self._project_weight_once(self.weight.dtype)  # Compute dynamically
-            self._cached_proj = (self.proj_scale.to(self.weight.dtype) * W_proj).detach()
+
+            W_proj = (self.proj_scale.to(self.weight.dtype) * W_proj)
+
+            _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=W_proj.dtype))
+
+            self._cached_proj = W_proj.detach()
 
         # Freeze A/B and alpha (or alpha_logit)
         for p in self._projector_params_iter():
@@ -705,8 +710,14 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             return
         self._lazy_norm_init(self.weight.dtype)
         if cache:
-            W_proj = self._project_weight_once(self.weight.dtype)
-            self._cached_proj = (self.proj_scale.to(self.weight.dtype) * W_proj).detach()
+            W_proj = self._project_weight_once(self.weight.dtype)  # Compute dynamically
+
+            W_proj = (self.proj_scale.to(self.weight.dtype) * W_proj)
+
+            _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=W_proj.dtype))
+
+            self._cached_proj = W_proj.detach()
+
         for p in self._projector_params_iter():
             p.requires_grad_(False)
         if drop_small and hasattr(self, "W_small") and self.W_small is not None:

@@ -1,114 +1,142 @@
 import torch
+import torch.nn as nn
 
-def _qr_orthonormal(shape, device, dtype):
-    """Return a random orthonormal matrix with given shape via QR."""
-    a = torch.empty(shape, device=device, dtype=dtype).normal_(0, 1)
-    q, r = torch.linalg.qr(a, mode='reduced')  # q: [m, n] with orthonormal columns
-    # Make Q deterministic sign-wise
-    d = torch.sign(torch.diag(r))
-    q = q @ torch.diag(d)
-    return q
-
-def _block_embed_matrix(out_dim, in_dim, device, dtype, noise=1e-3):
+@torch.no_grad()
+def svd_lora_init_from_small(
+    W_s: torch.Tensor,
+    d_b_out: int,
+    d_b_in: int,
+    r: int = None,
+    theta_deg: float = 8.0,   # Small angle, recommended 5°~10°
+    device=None,
+    dtype=None,
+    return_Wb0: bool = True,
+):
     """
-    Build E in R^{out_dim x in_dim}: top in_dim rows ~ orthonormal, bottom rows ~ small orth noise.
+    Use "small-angle orthogonal mixing (without increasing rank)" to upscale 
+    the small model weights W_s to the large model space, constructing 
+    LoRA-style A_out, B_out, A_in, B_in.
+    
+    Args:
+        W_s: (d_s_out, d_s_in) Small model weights
+        d_b_out: Large model output dimension
+        d_b_in : Large model input dimension
+        r: Truncated rank (default is min(d_s_out, d_s_in))
+        theta_deg: Small angle (in degrees); only affects the first r_mix columns
+        device, dtype: Optional; defaults to follow W_s
+        return_Wb0: Whether to return the deterministically initialized W_b^(0)
+    Returns:
+        A_out: (d_b_out, r)
+        B_out: (r, d_s_out)
+        A_in : (d_b_in , r)
+        B_in : (r, d_s_in)
+        W_b0 (optional): (d_b_out, d_b_in)
     """
-    # Orthonormal columns for the first in_dim rows
-    q = _qr_orthonormal((in_dim, in_dim), device, dtype)  # square orthonormal
-    if out_dim == in_dim:
-        E = q
-    else:
-        extra = torch.empty(out_dim - in_dim, in_dim, device=device, dtype=dtype)
-        torch.nn.init.orthogonal_(extra)
-        extra.mul_(noise)
-        E = torch.cat([q, extra], dim=0)
-    return E
+    if device is None: device = W_s.device
+    if dtype  is None: dtype  = W_s.dtype
 
-def _svd_align_AB_from_small(W_small: torch.Tensor, out_dim: int, rank: int, device, dtype):
-    """
-    Thin SVD on W_small: W_small ≈ U_r Σ_r V_r^T.
-    Build A, B so that A ≈ [U_r; 0]*Σ^{1/2}, B ≈ Σ^{1/2}*V_r^T (truncated/padded to desired sizes).
-    """
-    with torch.no_grad():
-        # W_small: [d_out_s, d_in_s]
-        d_out_s, d_in_s = W_small.shape
-        r = min(rank, d_out_s, d_in_s)
-        # torch.svd is deprecated; use torch.linalg.svd
-        U, S, Vh = torch.linalg.svd(W_small.to(device=device, dtype=dtype), full_matrices=False)
-        U_r = U[:, :r]         # [d_out_s, r]
-        V_r = Vh[:r, :].T      # [d_in_s, r]
-        S_r = S[:r]            # [r]
+    d_s_out, d_s_in = W_s.shape
+    if r is None:
+        r = min(d_s_out, d_s_in)
 
-        # A: [out_dim, r], B: [r, d_in_s]
-        # Put sqrt(S) half to both sides for balanced scaling
-        S_sqrt = S_r.clamp_min(1e-12).sqrt()         # [r]
-        A = torch.zeros(out_dim, r, device=device, dtype=dtype)
-        B = torch.zeros(r, d_in_s, device=device, dtype=dtype)
+    # 1) Thin SVD (truncated to rank=r)
+    # W_s ≈ U_s Σ_s V_s^T
+    # torch.linalg.svd returns U, S, Vh, where Vh = V^T
+    U, S, Vh = torch.linalg.svd(W_s.to(device=device, dtype=dtype), full_matrices=False)
+    U_s = U[:, :r]                             # (d_s_out, r)
+    S_r = S[:r]                                # (r,)
+    V_s = Vh[:r, :].T                          # (d_s_in, r)
 
-        # Embed U_r to top of A (rest small noise); multiply columns by sqrt(S)
-        A_top = U_r * S_sqrt.unsqueeze(0)            # [d_out_s, r]
-        if out_dim >= d_out_s:
-            A[:d_out_s, :] = A_top
-            if out_dim > d_out_s:
-                noise = torch.empty(out_dim - d_out_s, r, device=device, dtype=dtype)
-                torch.nn.init.orthogonal_(noise)
-                noise.mul_(1e-3)
-                A[d_out_s:, :] = noise
-        else:
-            A[:, :] = A_top[:out_dim, :]
+    # 2) Embed into the upper block of the large space: U_e, V_e
+    # U_e = [U_s; 0], shape (d_b_out, r)
+    # V_e = [V_s; 0], shape (d_b_in , r)
+    def pad_upper(U_small, big_rows):
+        d_small, rr = U_small.shape
+        out = torch.zeros(big_rows, rr, device=device, dtype=dtype)
+        out[:d_small, :] = U_small
+        return out
 
-        # B = (sqrt(S) * V_r^T)
-        B[:, :d_in_s] = (S_sqrt.unsqueeze(1) * V_r.T)
+    U_e = pad_upper(U_s, d_b_out)  # (d_b_out, r)
+    V_e = pad_upper(V_s, d_b_in)   # (d_b_in , r)
 
-        return nn.Parameter(A), nn.Parameter(B)
+    # 3) Orthogonal complement Q_perp for the lower block: use standard basis 
+    # (identity matrix columns in the lower part), naturally orthogonal to U_e/V_e
+    # The number of mixable columns r_mix is limited by the complement space dimension
+    r_mix_out = min(r, max(0, d_b_out - d_s_out))
+    r_mix_in  = min(r, max(0, d_b_in  - d_s_in ))
 
-def init_AB_pair(out_dim, in_dim_small, rank, device, dtype,
-                  method="orthogonal_embed",
-                  the_same_with_weight=False,
-                  init_method_function=None,
-                  W_small_block: torch.Tensor=None):
-    """
-    New methods:
-      - 'orthogonal_embed' (default): E_out = [Q; small_orth_noise], E_in = [Q; small_orth_noise]
-      - 'svd_align': use thin-SVD of W_small_block for principal-direction alignment (still static)
-      - 'orthogonal' and 'normal' keep your original behavior for backward-compat
-    """
-    A = nn.Parameter(torch.empty(out_dim, rank, device=device, dtype=dtype))
-    B = nn.Parameter(torch.empty(rank, in_dim_small, device=device, dtype=dtype))
+    def make_Q_perp(big_rows, small_rows, rr_mix, rr_total):
+        """
+        Generate Q_perp_full ∈ R^{big_rows × rr_total}:
+        - The first rr_mix columns place identity vectors in the lower block, 
+          other columns are zero
+        - Naturally orthogonal to the upper block (U_e upper is non-zero, lower is zero)
+        """
+        Q_full = torch.zeros(big_rows, rr_total, device=device, dtype=dtype)
+        if rr_mix > 0:
+            # Place I_{rr_mix} in the lower block
+            Q_full[small_rows: small_rows + rr_mix, :rr_mix] = torch.eye(rr_mix, device=device, dtype=dtype)
+        return Q_full  # (big_rows, rr_total)
 
-    if method == "orthogonal_embed":
-        # A: [out_dim, rank] ~ block-embedded orthonormal; B: [rank, in_dim_small] ~ orthonormal rows
-        # 先做方形正交，再“嵌入+微扰”
-        A.data.copy_(_block_embed_matrix(out_dim, rank, device, dtype, noise=1e-3))
-        # 对 B：让每一行互相正交（即 B^T 列正交），用 QR 生成 rank×rank，再右侧拼零/小噪声
-        B_square = _qr_orthonormal((in_dim_small, in_dim_small), device, dtype)  # [in_dim_small, in_dim_small]
-        # 取其前 rank 行的转置等价于取前 rank 列，再转置
-        if rank <= in_dim_small:
-            B.data.copy_(B_square[:, :rank].T)
-        else:
-            # rank 大于 in_dim_small 的情况很少见，做零填充并加微扰
-            tmp = B_square.T  # [in_dim_small, in_dim_small]
-            pad = torch.zeros(rank - in_dim_small, in_dim_small, device=device, dtype=dtype)
-            B.data.copy_(torch.cat([tmp, pad], dim=0))
-            B.data.add_(1e-3 * torch.empty_like(B).normal_(0, 1))
+    Q_perp_out = make_Q_perp(d_b_out, d_s_out, r_mix_out, r)  # (d_b_out, r)
+    Q_perp_in  = make_Q_perp(d_b_in , d_s_in , r_mix_in , r)  # (d_b_in , r)
 
-    elif method == "svd_align":
-        assert W_small_block is not None, "svd_align requires W_small_block (the small weight of this layer)"
-        A_, B_ = _svd_align_AB_from_small(W_small_block, out_dim, rank, device, dtype)
-        A = A_; B = B_
+    # 4) Small-angle mixing (ensure theta is non-zero whenever mixing is possible)
+    #    Use the same angle for the first max(r_mix_out, r_mix_in) columns.
+    theta = torch.zeros(r, device=device, dtype=dtype)
+    r_mix = max(r_mix_out, r_mix_in)
+    if r_mix > 0:
+        th = float(theta_deg) * 3.141592653589793 / 180.0
+        theta[:r_mix] = th
 
-    elif method == "orthogonal":
-        torch.nn.init.orthogonal_(A)
-        torch.nn.init.orthogonal_(B)
+    cos_t = torch.cos(theta)   # (r,)
+    sin_t = torch.sin(theta)   # (r,)
 
-    elif method == "normal":
-        if the_same_with_weight:
-            assert init_method_function is not None, "init_method_function must be provided when the_same_with_weight is True"
-            init_method_function(A); init_method_function(B)
-        else:
-            torch.nn.init.normal_(A, mean=0.0, std=(1.0 / max(1, in_dim_small) ** 0.5))
-            torch.nn.init.normal_(B, mean=0.0, std=(1.0 / max(1, rank) ** 0.5))
-    else:
-        raise ValueError(f"Unknown init method: {method}")
+    # Broadcast to columns
+    def blend(Ue, Qperp, cos_t, sin_t):
+        # Ue * cos + Qperp * sin  -> orthogonal columns with non-zero lower part
+        return Ue * cos_t.unsqueeze(0) + Qperp * sin_t.unsqueeze(0)
 
-    return A, B
+    U_tilde = blend(U_e, Q_perp_out, cos_t, sin_t)  # (d_b_out, r)
+    V_tilde = blend(V_e, Q_perp_in , cos_t, sin_t)  # (d_b_in , r)
+
+    # 5) Construct sqrt(Σ) (only scale columns, no need to explicitly construct diagonal matrix)
+    sqrtS = torch.sqrt(S_r + 1e-12)    # (r,)
+
+    # A_out = U_tilde * sqrtΣ,     B_out = sqrtΣ * U_s^T
+    A_out = U_tilde * sqrtS.unsqueeze(0)           # (d_b_out, r)
+    B_out = (sqrtS.unsqueeze(1) * U_s.T)           # (r, d_s_out)
+
+    # A_in  = V_tilde * sqrtΣ,     B_in  = sqrtΣ * V_s^T
+    A_in  = V_tilde * sqrtS.unsqueeze(0)           # (d_b_in,  r)
+    B_in  = (sqrtS.unsqueeze(1) * V_s.T)           # (r, d_s_in)
+
+    if not return_Wb0:
+        return A_out, B_out, A_in, B_in
+
+    # 6) Optional: Deterministic upscaled initialization weights W_b^(0) = U_tilde Σ V_tilde^T
+    # Similarly avoid explicit diagonal: U_tilde * S then right-multiply V_tilde^T
+    Wb0 = (U_tilde * S_r.unsqueeze(0)) @ V_tilde.T  # (d_b_out, d_b_in)
+    return A_out, B_out, A_in, B_in, Wb0
+
+
+# ===== Example Usage =====
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    # Small model weights (example)
+    d_s_out, d_s_in = 8, 6
+    W_small = torch.randn(d_s_out, d_s_in)
+
+    # Target large model dimensions
+    d_b_out, d_b_in = 12, 10
+
+    # Truncated rank r (usually min(d_s_out, d_s_in) or smaller)
+    r = min(d_s_out, d_s_in)
+
+    Aout, Bout, Ain, Bin, Wb0 = svd_lora_init_from_small(
+        W_small, d_b_out, d_b_in, r=r, theta_deg=8.0, return_Wb0=True
+    )
+
+    print("A_out:", Aout.shape, "B_out:", Bout.shape)
+    print("A_in :", Ain.shape,  "B_in :",  Bin.shape)
+    print("W_b0 :", Wb0.shape)

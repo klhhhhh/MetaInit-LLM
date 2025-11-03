@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
@@ -18,6 +19,8 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from projection.layer_projection import (
     ColumnParallelLinearWithProjector,
     RowParallelLinearWithProjector)
+
+from projection.projection_init import svd_lora_init_from_small
 
 from nemo_utils.model_loader import load_model_to_cpu
 from nemo_utils.model_builder import build_model
@@ -91,24 +94,26 @@ class ModelProjectionUtils:
 
         return expanded_params
 
-    def normalize_projection(self, W_projected, W_target):
+    # ======== Renamed: Frobenius-norm matching (kept to avoid collision with row-std version) ========
+    def normalize_projection_fro(self, W_projected, W_target):
         """
         Normalize the projected weight matrix to match the Frobenius norm of the target matrix.
         """
         projected_norm = torch.norm(W_projected, p='fro')
         target_norm = torch.norm(W_target, p='fro')
         if projected_norm > 0:
-            print(f"Normalizing projection from {projected_norm:.4f} to {target_norm:.4f}")
+            print(f"Normalizing projection (Fro) from {projected_norm:.4f} to {target_norm:.4f}")
             W_projected = W_projected * (target_norm / projected_norm)
         return W_projected
     
-    def normalize_projection(self, W_large: torch.Tensor, target_param: torch.Tensor,
-                            nonlin: str = 'gelu', use_target_stats: bool = True,
-                            eps: float = 1e-8) -> torch.Tensor:
+    # ======== Renamed: row-wise std alignment (default calibration) ========
+    def normalize_projection_rowstd(self, W_large: torch.Tensor, target_param: torch.Tensor,
+                                    nonlin: str = 'gelu', use_target_stats: bool = True,
+                                    eps: float = 1e-8) -> torch.Tensor:
         """
-        Perform one-time calibration of the projected weights W_large:
-        - By default, align to the row-wise std of target_param (most stable).
-        - If a suitable target_param is not available, fallback to fan-in theoretical std (Xavier/He initialization).
+        One-time calibration of W_large via row-wise std alignment:
+        - Prefer aligning to the row-wise std of target_param (stable).
+        - Fallback to theoretical fan-in std (Xavier/He) if no target stats are available.
         """
         W = W_large
         if use_target_stats and target_param is not None and target_param.numel() > 0 \
@@ -138,13 +143,41 @@ class ModelProjectionUtils:
         d_head = W_q_or_k.size(0) // num_heads
         return W_q_or_k / (d_head ** 0.5)
 
-
-    def dispatch_projection(self, name, W_small, target_shape, target_param, projection_rank=32):
+    # ========= Minimal change wrapper: call imported SVD initializer and row-std calibrate =========
+    def svd_small_angle_project(self, W_small: torch.Tensor,
+                                target_shape: tuple,
+                                target_param: torch.Tensor,
+                                r: int = None,
+                                theta_deg: float = 8.0) -> torch.Tensor:
         """
-        Determine the projection method based on the parameter name:
-        - qkv: Split into Q, K, V and use symmetric projection
-        - linear_proj: Use symmetric projection
-        - mlp (fc1, fc2): Use asymmetric projection
+        Use svd_lora_init_from_small from projection_init.py to upscale W_small to (d_b_out, d_b_in),
+        then apply row-wise std alignment against target_param.
+        """
+        d_b_out, d_b_in = target_shape
+        _,_,_,_,ret = svd_lora_init_from_small(
+            W_s=W_small,
+            d_b_out=d_b_out,
+            d_b_in=d_b_in,
+            r=r,
+            theta_deg=theta_deg,
+            device=W_small.device,
+            dtype=W_small.dtype,
+            return_Wb0=True,
+        )
+        # The imported function returns (A_out, B_out, A_in, B_in, Wb0) when return_Wb0=True.
+        # Keep it robust in case of signature differences.
+        Wb0 = ret[-1] if isinstance(ret, (tuple, list)) and len(ret) >= 1 else ret
+        Wb0 = self.normalize_projection_rowstd(Wb0, target_param)
+        return Wb0
+
+    def dispatch_projection(self, name, W_small, target_shape, target_param, projection_rank=32,
+                            svd_rank=None, theta_deg: float = 8.0):
+        """
+        Decide projection method by parameter name (non-learnable path):
+        - Prefer SVD + small-angle mixing (via svd_lora_init_from_small).
+        - QKV: split and apply SVD per chunk.
+        - Others: apply SVD directly.
+        Keep projection_rank in the signature for backward compatibility (unused here).
         """
         self.current_param_name = name
 
@@ -152,23 +185,26 @@ class ModelProjectionUtils:
             # Split into Q, K, V
             q, k, v = torch.chunk(W_small, 3, dim=0)
             out_chunks = target_shape[0] // 3
-            Wq = self.lora_style_projection_symmetric(q, (out_chunks, target_shape[1]), target_param[:out_chunks, :out_chunks],
-                                                    projection_rank, num_heads=self.num_heads, is_q=True)
-            Wk = self.lora_style_projection_symmetric(k, (out_chunks, target_shape[1]), target_param[out_chunks:2*out_chunks, out_chunks:2*out_chunks],
-                                                    projection_rank, num_heads=self.num_heads, is_k=True)
-            Wv = self.lora_style_projection_symmetric(v, (out_chunks, target_shape[1]), target_param[2*out_chunks:, 2*out_chunks:],
-                                                    projection_rank)
+            tgt_q = target_param[:out_chunks, :target_shape[1]]
+            tgt_k = target_param[out_chunks:2*out_chunks, :target_shape[1]]
+            tgt_v = target_param[2*out_chunks:, :target_shape[1]]
+
+            Wq = self.svd_small_angle_project(q, (out_chunks, target_shape[1]), tgt_q, r=svd_rank, theta_deg=theta_deg)
+            Wk = self.svd_small_angle_project(k, (out_chunks, target_shape[1]), tgt_k, r=svd_rank, theta_deg=theta_deg)
+            Wv = self.svd_small_angle_project(v, (out_chunks, target_shape[1]), tgt_v, r=svd_rank, theta_deg=theta_deg)
+
+            # If you need extra 1/sqrt(d_head) scaling for Q/K, uncomment:
+            # Wq = self._apply_qk_head_scaling(Wq, self.num_heads)
+            # Wk = self._apply_qk_head_scaling(Wk, self.num_heads)
+
             return torch.cat([Wq, Wk, Wv], dim=0)
 
-        elif "linear_proj.weight" in name:
-            return self.lora_style_projection_symmetric(W_small, target_shape, target_param, projection_rank)
-
-        elif "mlp" in name or "fc1" in name or "fc2" in name:
-            return self.lora_style_projection_asymmetric(W_small, target_shape, target_param, projection_rank)
+    # Default: also use SVD small-angle projection
+        elif "linear_proj.weight" in name or "mlp" in name or "fc1" in name or "fc2" in name:
+            return self.svd_small_angle_project(W_small, target_shape, target_param, r=svd_rank, theta_deg=theta_deg)
 
         else:
-            # Default to symmetric projection (you can also raise a warning)
-            return self.lora_style_projection_symmetric(W_small, target_shape, target_param, projection_rank)
+            return self.svd_small_angle_project(W_small, target_shape, target_param, r=svd_rank, theta_deg=theta_deg)
     
     def lora_style_projection_symmetric(self, W_small, target_shape, target_param, rank=32,
                                     spectral_scale=0.1, num_heads=None, is_q=False, is_k=False):
@@ -183,7 +219,8 @@ class ModelProjectionUtils:
         if num_heads is not None and (is_q or is_k):
             W_large = self._apply_qk_head_scaling(W_large, num_heads)
 
-        W_large = self.normalize_projection(W_large, target_param)  # Row-wise std alignment
+        # Use the row-wise std alignment
+        W_large = self.normalize_projection_rowstd(W_large, target_param)
         return W_large
 
 
@@ -204,9 +241,10 @@ class ModelProjectionUtils:
 
         A1, A2 = self._orthogonal_factors(out_large, out_small, rank, W_small.device, spectral_scale)
         B1, B2 = self._orthogonal_factors(in_small, in_large, rank, W_small.device, spectral_scale)
-        # W_large = (A1 @ A2) @ W_small @ (B1 @ B2)
         W_large = (A1 @ (A2 @ W_small @ B1)) @ B2
-        W_large = self.normalize_projection(W_large, target_param)  # Row-wise std alignment
+
+        # Use the row-wise std alignment
+        W_large = self.normalize_projection_rowstd(W_large, target_param)
         return W_large
 
     def _bind_init_kwargs_from_record(self, layer, rec: dict) -> dict:
@@ -220,6 +258,7 @@ class ModelProjectionUtils:
 
         # Try binding to the layer class __init__ signature (to map positional -> names)
         try:
+            import inspect
             sig = inspect.signature(layer.__class__.__init__)
             ba = sig.bind_partial(layer, *args, **kwargs)  # include self
             bound = {k: v for k, v in ba.arguments.items() if k != "self"}

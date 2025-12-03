@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=bdrx-dtai-gh
+#SBATCH --account=bdrw-dtai-gh
 #SBATCH --partition=ghx4
 #SBATCH --time=12:00:00
 #SBATCH --nodes=8
@@ -13,4 +13,4 @@
 #SBATCH --mail-user=nankaicslk@gmail.com
 
 srun --export=ALL --cpu-bind=none \
-     bash /u/klin4/MetaInit-LLM/scripts/train/project_train.sh
+     bash /u/klin4/MetaInit-LLM/scripts/train/seperate_train/project_seperate_train.sh

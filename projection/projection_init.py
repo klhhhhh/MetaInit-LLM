@@ -77,28 +77,60 @@ def svd_lora_init_from_small(
             # Place I_{rr_mix} in the lower block
             Q_full[small_rows: small_rows + rr_mix, :rr_mix] = torch.eye(rr_mix, device=device, dtype=dtype)
         return Q_full  # (big_rows, rr_total)
+    
+    def make_Q_perp_DCT(big_rows, small_rows, rr_mix, rr_total):
+        """
+        Deterministic & smooth orthonormal lower-block basis via DCT (+QR).
+        Returns Q_full ∈ R^{big_rows × rr_total} whose first rr_mix columns
+        live in the lower block (rows [small_rows:]) and are orthonormal.
+        """
+        Q_full = torch.zeros(big_rows, rr_total, device=device, dtype=dtype)
+        low_rows = big_rows - small_rows
+        if rr_mix > 0 and low_rows > 0:
+            # DCT-II kernel on the lower block
+            n = torch.arange(low_rows, device=device, dtype=dtype).unsqueeze(1)    # (low_rows, 1)
+            k = torch.arange(rr_mix,  device=device, dtype=dtype).unsqueeze(0)    # (1, rr_mix)
+            C = torch.cos(3.141592653589793 * (n + 0.5) * k / float(low_rows))    # (low_rows, rr_mix)
+
+            # Orthonormalize deterministically to remove numerical correlations
+            Q, _ = torch.linalg.qr(C, mode='reduced')                              # (low_rows, rr_mix)
+
+            # Fix column signs for determinism (first nonzero entry positive)
+            for j in range(Q.shape[1]):
+                col = Q[:, j]
+                idx = (col.abs() > 1e-12).nonzero(as_tuple=True)[0]
+                if idx.numel() > 0 and col[idx[0]] < 0:
+                    Q[:, j] = -col
+
+            Q_full[small_rows:, :rr_mix] = Q
+        return Q_full
+
 
     Q_perp_out = make_Q_perp(d_b_out, d_s_out, r_mix_out, r)  # (d_b_out, r)
     Q_perp_in  = make_Q_perp(d_b_in , d_s_in , r_mix_in , r)  # (d_b_in , r)
 
-    # 4) Small-angle mixing (ensure theta is non-zero whenever mixing is possible)
-    #    Use the same angle for the first max(r_mix_out, r_mix_in) columns.
-    theta = torch.zeros(r, device=device, dtype=dtype)
-    r_mix = max(r_mix_out, r_mix_in)
-    if r_mix > 0:
+    # 4) Small-angle mixing with two separate angle vectors to keep orthonormality
+    #    - theta_out: non-zero only for the first r_mix_out columns
+    #    - theta_in : non-zero only for the first r_mix_in  columns
+    theta_out = torch.zeros(r, device=device, dtype=dtype)
+    theta_in  = torch.zeros(r, device=device, dtype=dtype)
+    if r_mix_out > 0 or r_mix_in > 0:
         th = float(theta_deg) * 3.141592653589793 / 180.0
-        theta[:r_mix] = th
+        if r_mix_out > 0:
+            theta_out[:r_mix_out] = th
+        if r_mix_in > 0:
+            theta_in[:r_mix_in] = th
 
-    cos_t = torch.cos(theta)   # (r,)
-    sin_t = torch.sin(theta)   # (r,)
+    cos_out, sin_out = torch.cos(theta_out), torch.sin(theta_out)  # (r,)
+    cos_in,  sin_in  = torch.cos(theta_in),  torch.sin(theta_in)   # (r,)
 
-    # Broadcast to columns
+    # Column-wise blend: Ue * cos + Qperp * sin
     def blend(Ue, Qperp, cos_t, sin_t):
-        # Ue * cos + Qperp * sin  -> orthogonal columns with non-zero lower part
         return Ue * cos_t.unsqueeze(0) + Qperp * sin_t.unsqueeze(0)
 
-    U_tilde = blend(U_e, Q_perp_out, cos_t, sin_t)  # (d_b_out, r)
-    V_tilde = blend(V_e, Q_perp_in , cos_t, sin_t)  # (d_b_in , r)
+    U_tilde = blend(U_e, Q_perp_out, cos_out, sin_out)  # (d_b_out, r)
+    V_tilde = blend(V_e, Q_perp_in , cos_in , sin_in )  # (d_b_in , r)
+
 
     # 5) Construct sqrt(Σ) (only scale columns, no need to explicitly construct diagonal matrix)
     sqrtS = torch.sqrt(S_r + 1e-12)    # (r,)

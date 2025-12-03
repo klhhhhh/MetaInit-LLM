@@ -34,7 +34,7 @@ def main(
 
     if learnable:
         logging.info("Projected parameters will be learnable.")
-        projection_training_callback = [AlphaScheduleAndFreeze(schedule="cosine", mode="decay", start_value=0.0, end_value=1.0, start_step=0, end_step=2000, freeze_at=2000, cache_on_freeze=True, drop_small_on_freeze=True, verbose=True)]
+        projection_training_callback = [AlphaScheduleAndFreeze(schedule="cosine", mode="decay", start_value=0.0, end_value=1.0, start_step=0, end_step=5000, freeze_at=2000, cache_on_freeze=True, drop_small_on_freeze=True, verbose=True)]
     else:
         logging.info("Projected parameters will not be learnable.")
         projection_training_callback = None

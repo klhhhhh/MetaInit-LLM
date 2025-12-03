@@ -129,6 +129,11 @@ class ModelProjectionUtils:
         cur = W.std(dim=1, keepdim=True).clamp_min(eps)
         scale = tgt / cur
         return W * scale  # Row-wise scaling
+    
+    def normalize_projection_fro_to_small(self, Wb0, W_small, eps=1e-8):
+        num = torch.norm(W_small, p='fro')
+        den = torch.norm(Wb0,    p='fro').clamp_min(eps)
+        return Wb0 * (num / den)
 
     def _orthogonal_factors(self, out_dim, in_dim_small, rank, device, spectral_scale=0.1):
         A = torch.empty(out_dim, rank, device=device)
@@ -168,6 +173,7 @@ class ModelProjectionUtils:
         # Keep it robust in case of signature differences.
         Wb0 = ret[-1] if isinstance(ret, (tuple, list)) and len(ret) >= 1 else ret
         Wb0 = self.normalize_projection_rowstd(Wb0, target_param)
+        # Wb0 = self.normalize_projection_fro_to_small(Wb0, W_small)
         return Wb0
 
     def dispatch_projection(self, name, W_small, target_shape, target_param, projection_rank=32,

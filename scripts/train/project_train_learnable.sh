@@ -4,6 +4,7 @@ eval "$(conda shell.bash hook)"
 source /u/klin4/envs/build_nemo.sh
 conda activate nemo
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/u/klin4/.conda/envs/nemo/bin:$PATH"
 export WANDB_API_KEY=54c49dff7abb6ed19894a8aaec8b305d316f0072
 
@@ -43,8 +44,8 @@ export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
 echo "✅ PYTHONPATH set to: $PYTHONPATH"
 
 # Set default parameters
-NNODES=1
-NPROC_PER_NODE=1
+NNODES=8
+NPROC_PER_NODE=4
 SCRIPT_PATH="$PROJECT_DIR/training/projection_init_pretraining.py"
 
 # Parameters passed to Python
@@ -52,7 +53,7 @@ SMALL_MODEL_PATH="/work/hdd/bdrw/klin4/run_gpt_124m/megatron_gpt/checkpoints_124
 LARGE_MODEL_CFG_NAME="megatron_gpt_350m_config"
 PROJECT_DEVICE="cpu"
 TRAIN_DEVICE="cuda"
-RANK=128
+RANK=1024
 LEARNABLE="--learnable"
 
 # Enable learnable if needed

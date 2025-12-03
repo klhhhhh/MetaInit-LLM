@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# from projection.projection_init import init_AB_pair
+
 # ------------------------------------------------
 # Small-variance low-rank initialization; consistent with the original code style
 # ------------------------------------------------
@@ -203,7 +205,7 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
 
         # ---- α in [0,1]: Parameterized using logit for easier scheduling/constraints ----
         # Initialize α≈1e-3 => logit(α) ≈ log(α/(1-α))
-        alpha0 = 5e-1
+        alpha0 = 1e-1
         alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
         self.alpha_logit = nn.Parameter(alpha_logit_init)
 
@@ -455,7 +457,7 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
                 with torch.no_grad():
                     W_proj = self._project_weight_once(input_dtype)
                     W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
-                    # _apply_per_channel_scale_(W_proj_scaled, self.per_channel_scale.to(dtype=input_dtype))
+                    _apply_per_channel_scale_(W_proj_scaled, self.per_channel_scale.to(dtype=input_dtype))
 
             W_base = self.weight.to(dtype=input_dtype)
             alpha_eff = self._alpha(dtype=input_dtype)
@@ -469,7 +471,7 @@ class ColumnParallelLinearWithProjector(ColumnParallelLinear):
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
 
         # After generating W_proj_scaled, apply per-channel scaling
-        # _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=input_dtype))
+        _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=input_dtype))
 
 
         # 3) Residual fusion: W_eff = W_base + alpha * W_proj
@@ -554,7 +556,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
             self.A_in,  self.B_in  = _init_AB_pair(d_in_large,  d_in_small,  rank, device, dtype)
 
         # α in [0,1]
-        alpha0 = 5e-1
+        alpha0 = 1e-1
         alpha_logit_init = torch.log(torch.tensor(alpha0, device=device, dtype=dtype) / (1 - torch.tensor(alpha0, device=device, dtype=dtype)))
         self.alpha_logit = nn.Parameter(alpha_logit_init)
 
@@ -734,7 +736,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
                 with torch.no_grad():
                     W_proj = self._project_weight_once(input_dtype)
                     W_proj_scaled = (self.proj_scale.to(input_dtype) * W_proj).detach()
-                    # _apply_per_channel_scale_(W_proj_scaled, self.per_channel_scale.to(dtype=input_dtype))
+                    _apply_per_channel_scale_(W_proj_scaled, self.per_channel_scale.to(dtype=input_dtype))
             W_base = self.weight.to(dtype=input_dtype)
             alpha_eff = self._alpha(dtype=input_dtype)
             return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj_scaled
@@ -742,7 +744,7 @@ class RowParallelLinearWithProjector(RowParallelLinear):
         self._lazy_norm_init(input_dtype)
         W_proj = self._project_weight_once(input_dtype)
         W_proj = self.proj_scale.to(dtype=input_dtype) * W_proj
-        # _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=input_dtype))
+        _apply_per_channel_scale_(W_proj, self.per_channel_scale.to(dtype=input_dtype))
         W_base = self.weight.to(dtype=input_dtype)
         alpha_eff = self._alpha(dtype=input_dtype)
         return (1.0 - alpha_eff) * W_base + alpha_eff * W_proj
